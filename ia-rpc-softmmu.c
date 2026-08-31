@@ -519,6 +519,43 @@ static QDict *ia_make_symbolic_label_entry(dfsan_label label)
         qdict_put_int(entry, "right_label", info->l2);
         qdict_put_int(entry, "op1", info->op1.i);
         qdict_put_int(entry, "op2", info->op2.i);
+
+        if ((info->op & 0xff) == Load) {
+            dfsan_label addr_label = 0;
+            target_ulong concrete_addr = 0;
+            uint64_t concrete_value = 0;
+            uint64_t pc = 0;
+            QDict *load = qdict_new();
+
+            qdict_put_int(load, "byte_count", info->l2);
+            if (symsan_find_load_metadata_for_label(
+                    label, &addr_label, &concrete_addr, &concrete_value, &pc)) {
+                g_autofree char *addr_label_hex =
+                    g_strdup_printf("0x%x", addr_label);
+                g_autofree char *concrete_addr_hex =
+                    g_strdup_printf("0x%" PRIx64, (uint64_t)concrete_addr);
+                g_autofree char *concrete_value_hex =
+                    g_strdup_printf("0x%" PRIx64, concrete_value);
+                g_autofree char *pc_hex =
+                    g_strdup_printf("0x%" PRIx64, pc);
+
+                qdict_put_str(load, "kind", "symbolic_address");
+                qdict_put_str(load, "address_label", addr_label_hex);
+                qdict_put_str(load, "concrete_address", concrete_addr_hex);
+                qdict_put_str(load, "concrete_value", concrete_value_hex);
+                qdict_put_str(load, "pc", pc_hex);
+            } else {
+                IADfsanLabelInfo *first = dfsan_get_label_info(info->l1);
+
+                if (first && (first->op & 0xff) == 0 && first->size == 8) {
+                    qdict_put_str(load, "kind", "input_bytes");
+                    qdict_put_int(load, "first_input_offset", first->op1.i);
+                } else {
+                    qdict_put_str(load, "kind", "unresolved");
+                }
+            }
+            qdict_put(entry, "load", load);
+        }
     }
     return entry;
 }

@@ -313,6 +313,12 @@ Returns:
 - `op`: label op name
 - `size`: label bit width or boolean width marker
 - `left_label`, `right_label`, `op1`, `op2`: backend label metadata
+- `load`: present when `op` is `Load`; includes `kind` and `byte_count`.
+  `input_bytes` loads also include `first_input_offset`.
+  `symbolic_address` loads include the address label, concrete address/value,
+  and PC needed to reproduce the solver's concretized-load assumption.
+  `unresolved` means the backend cannot safely classify the load; consumers
+  must not infer solver semantics from the generic label fields.
 
 ### `get_path_constraints`
 
