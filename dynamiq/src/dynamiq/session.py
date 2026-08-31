@@ -894,6 +894,18 @@ class AnalysisSession:
             raise UnsupportedOperationError("backend does not support path-constraint solving")
         return self._forward("solve_path_constraint", backend_method(label=label, negate=negate))
 
+    def get_path_constraint_smt2(self, label: str, negate: bool = True) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "get_path_constraint_smt2", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support SMT2 path-constraint export")
+        return self._forward("get_path_constraint_smt2", backend_method(label=label, negate=negate))
+
+    def get_path_constraint_evaluated(self, label: str, negate: bool = True) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "get_path_constraint_evaluated", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support evaluated path-constraint export")
+        return self._forward("get_path_constraint_evaluated", backend_method(label=label, negate=negate))
+
     def disassemble(self, address: str, count: int = 16) -> dict[str, Any]:
         if count > self.config.max_disassembly_instructions:
             raise InvalidStateError(

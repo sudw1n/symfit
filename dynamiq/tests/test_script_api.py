@@ -211,6 +211,28 @@ class MockBackend(BackendAdapter):
             },
         }
 
+    def get_path_constraint_smt2(self, label, negate=True):
+        self.call_history.append(f"get_path_constraint_smt2:{label}:{negate}")
+        return {
+            "ok": True,
+            "state": {},
+            "result": {"label": label, "negate": negate, "status": "sat", "smt2": "(assert true)"},
+        }
+
+    def get_path_constraint_evaluated(self, label, negate=True):
+        self.call_history.append(f"get_path_constraint_evaluated:{label}:{negate}")
+        return {
+            "ok": True,
+            "state": {},
+            "result": {
+                "label": label,
+                "negate": negate,
+                "status": "sat",
+                "smt2": "(assert true)",
+                "evaluated": "true",
+            },
+        }
+
     def break_at_addresses(self, addresses, timeout=5.0, max_steps=10000):
         self.call_history.append(f"break_at_addresses:{addresses}")
         return {
@@ -471,6 +493,26 @@ class TestScriptSessionMethodDelegation:
         assert result["result"]["root"]["taken"] is True
         assert result["result"]["constraints"][0]["taken"] is True
         assert "path_constraint_closure:0x12" in backend.call_history
+
+    def test_get_path_constraint_smt2_delegation(self):
+        backend = MockBackend()
+        session = ScriptSession(target="/bin/ls", backend=backend)
+
+        result = session.get_path_constraint_smt2("0x12", negate=False)
+
+        assert result["ok"] is True
+        assert result["result"]["smt2"] == "(assert true)"
+        assert "get_path_constraint_smt2:0x12:False" in backend.call_history
+
+    def test_get_path_constraint_evaluated_delegation(self):
+        backend = MockBackend()
+        session = ScriptSession(target="/bin/ls", backend=backend)
+
+        result = session.get_path_constraint_evaluated("0x12", negate=False)
+
+        assert result["ok"] is True
+        assert result["result"]["evaluated"] == "true"
+        assert "get_path_constraint_evaluated:0x12:False" in backend.call_history
 
     def test_disassemble_delegation(self):
         """Test disassemble() delegates to backend."""
@@ -784,6 +826,8 @@ def test_all_expected_methods_accessible():
         "get_symbolic_expression",
         "recent_path_constraints",
         "path_constraint_closure",
+        "get_path_constraint_smt2",
+        "get_path_constraint_evaluated",
         # I/O (4)
         "write_stdin",
         "write_stdin_and_advance",

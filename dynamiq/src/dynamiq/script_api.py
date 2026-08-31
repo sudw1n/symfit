@@ -655,6 +655,30 @@ class ScriptSession:
         """
         return self._session.solve_path_constraint(label=label, negate=negate)
 
+    def get_path_constraint_smt2(self, label: str, negate: bool = True) -> dict[str, Any]:
+        """Export a recorded path constraint and its context as SMT-LIB2.
+
+        Args:
+            label: Recorded branch-condition label
+            negate: Export the opposite branch direction when true
+
+        Returns:
+            Response dict with SMT-LIB2 text and branch-direction metadata.
+        """
+        return self._session.get_path_constraint_smt2(label=label, negate=negate)
+
+    def get_path_constraint_evaluated(self, label: str, negate: bool = True) -> dict[str, Any]:
+        """Export a recorded path constraint as SMT-LIB2 and evaluated text.
+
+        Args:
+            label: Recorded branch-condition label
+            negate: Export the opposite branch direction when true
+
+        Returns:
+            Response dict with SMT-LIB2, evaluated text, and direction metadata.
+        """
+        return self._session.get_path_constraint_evaluated(label=label, negate=negate)
+
     # I/O Operations (4 methods)
     # ==========================
 
