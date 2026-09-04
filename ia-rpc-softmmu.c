@@ -1469,7 +1469,6 @@ static QDict *ia_handle_single_step(int64_t id, QDict *params)
     uint64_t executed;
     uint64_t stop_pc;
     const char *status;
-    CPUState *cpu;
     g_autofree char *pc_hex = NULL;
     QDict *result = qdict_new();
 
@@ -1523,7 +1522,6 @@ static QDict *ia_handle_single_step(int64_t id, QDict *params)
 
     budget_remaining = ia_state.instruction_budget;
     stop_pc = ia_state.last_insn_pc;
-    cpu = ia_state.current_cpu;
     status = ia_status_string_locked();
 
     // New state capture for watchpoints. This is done inside the mutex lock now to avoid potential race conditions.
@@ -1551,9 +1549,12 @@ static QDict *ia_handle_single_step(int64_t id, QDict *params)
             executed--;
         }
     }
-    if (strcmp(status, "paused") == 0) {
-        ia_current_cpu_pc(cpu, &stop_pc);
-    }
+    /*
+     * The instruction hook stops before the next guest instruction and records
+     * its exact address in last_insn_pc.  CPU architectural state can still
+     * contain the translation-block entry here, so querying it would replace
+     * the exact stop address with a stale PC.
+     */
 
     if (wp_write_matched || wp_read_matched) {
       QDict *watchpoint = qdict_new();
