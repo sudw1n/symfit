@@ -50,7 +50,17 @@
  * (N = number of input arguments + output arguments).  */
 #define MAX_OPC_PARAM (4 + (MAX_OPC_PARAM_PER_ARG * MAX_OPC_PARAM_ARGS))
 
+/*
+ * Symbolic translation creates an expression temporary alongside ordinary
+ * TCG temporaries.  CONFIG_2nd_CCACHE therefore doubles TCG_MAX_TEMPS below;
+ * its spill frame must grow by the same factor or register allocation can
+ * exhaust the frame and abort on otherwise valid translation blocks.
+ */
+#ifdef CONFIG_2nd_CCACHE
+#define CPU_TEMP_BUF_NLONGS 256
+#else
 #define CPU_TEMP_BUF_NLONGS 128
+#endif
 
 /* Default target word size to pointer size.  */
 #ifndef TCG_TARGET_REG_BITS
