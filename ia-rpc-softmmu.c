@@ -162,6 +162,7 @@ typedef struct IAState {
         uint64_t pc;
         dfsan_label label;
         bool taken;
+        bool exportable;
     } path_constraints[256];
     size_t path_constraints_head;
     size_t path_constraints_count;
@@ -569,13 +570,15 @@ static QDict *ia_make_symbolic_label_entry_with_taken(dfsan_label label, bool ta
 }
 
 static void ia_append_path_constraint_entry(QList *entries, uint64_t pc,
-                                            dfsan_label label, bool taken)
+                                            dfsan_label label, bool taken,
+                                            bool exportable)
 {
     QDict *entry = ia_make_symbolic_label_entry(label);
     g_autofree char *pc_hex = g_strdup_printf("0x%" PRIx64, pc);
 
     qdict_put_str(entry, "pc", pc_hex);
     qdict_put_bool(entry, "taken", taken);
+    qdict_put_bool(entry, "exportable", exportable);
     qlist_append(entries, entry);
 }
 
@@ -2335,7 +2338,8 @@ static QDict *ia_handle_get_recent_path_constraints(int64_t id, QDict *params)
         ia_append_path_constraint_entry(entries,
                                         ia_state.path_constraints[idx].pc,
                                         ia_state.path_constraints[idx].label,
-                                        ia_state.path_constraints[idx].taken);
+                                        ia_state.path_constraints[idx].taken,
+                                        ia_state.path_constraints[idx].exportable);
     }
     qemu_mutex_unlock(&ia_state.lock);
 
@@ -3547,6 +3551,8 @@ void symsan_record_path_constraint(uint64_t pc, dfsan_label label, bool taken)
 {
     size_t idx;
     size_t max_label;
+    uint8_t solver_taken = 0;
+    bool exportable;
 
     if (label == 0 || !ia_state.enabled) {
         return;
@@ -3561,11 +3567,16 @@ void symsan_record_path_constraint(uint64_t pc, dfsan_label label, bool taken)
         return;
     }
 
+    exportable = dfsan_get_branch_direction != NULL &&
+                 dfsan_get_branch_direction(label, &solver_taken) &&
+                 solver_taken == (taken ? 1 : 0);
+
     qemu_mutex_lock(&ia_state.lock);
     idx = ia_state.path_constraints_head;
     ia_state.path_constraints[idx].pc = pc;
     ia_state.path_constraints[idx].label = label;
     ia_state.path_constraints[idx].taken = taken;
+    ia_state.path_constraints[idx].exportable = exportable;
     ia_state.path_constraints_head = (idx + 1) % G_N_ELEMENTS(ia_state.path_constraints);
     if (ia_state.path_constraints_count < G_N_ELEMENTS(ia_state.path_constraints)) {
         ia_state.path_constraints_count++;

@@ -449,7 +449,11 @@ Behavior:
 - returns recently observed symbolic path constraints from the current session
 - entries are returned newest first
 - a path constraint is recorded from the backend's symbolic condition handling
-- entries are suitable roots for `get_path_constraints(label)`
+- entries with `exportable: true` are suitable roots for
+  `get_path_constraints(label)` and path-text export
+- `exportable: false` preserves an observed branch whose direction was not
+  retained by the active solver runtime; clients must report this as incomplete
+  path context instead of asking the solver to assert it
 
 Parameters:
 
@@ -457,7 +461,8 @@ Parameters:
 
 Returns:
 
-- `constraints`: array of symbolic-label objects with additional `pc` and `taken`
+- `constraints`: array of symbolic-label objects with additional `pc`, `taken`,
+  and `exportable`
 - `count`: number of entries returned
 - `truncated`: whether older entries were omitted
 
