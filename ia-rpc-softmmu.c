@@ -214,7 +214,7 @@ typedef struct IAState {
     } path_constraints[256];
     */
     GArray *path_constraints;
-    uint64_t symbolic_value_next_offset;
+    uint64_t symbolic_input_next_offset;
     QemuThread server_thread;
 } IAState;
 
@@ -1962,15 +1962,11 @@ static void ia_append_guest_memory_labels(QList *bytes, CPUState *cpu,
 }
 
 static bool ia_symbolize_guest_memory(CPUState *cpu, uint64_t addr, size_t size,
-                                      uint64_t pc, QList *bytes)
+                                      uint64_t base_offset, uint64_t pc,
+                                      QList *bytes)
 {
     CPUArchState *env = (CPUArchState *)cpu->env_ptr;
     size_t done = 0;
-
-    qemu_mutex_lock(&ia_state.lock);
-    uint64_t base_offset = ia_state.symbolic_value_next_offset;
-    ia_state.symbolic_value_next_offset += (uint64_t)size;
-    qemu_mutex_unlock(&ia_state.lock);
 
     while (done < size) {
         target_ulong cur = (target_ulong)(addr + done);
@@ -1984,8 +1980,8 @@ static bool ia_symbolize_guest_memory(CPUState *cpu, uint64_t addr, size_t size,
             return false;
         }
         for (i = 0; i < chunk; i++) {
-            dfsan_label label = dfsan_create_label_with_value(
-                (off_t)(base_offset + done + i), host[i]);
+            dfsan_label label =
+                dfsan_create_label((off_t)(base_offset + done + i));
             dfsan_store_label(label, host + i, 1, pc);
             qlist_append(bytes, ia_make_symbolic_byte_entry(done + i, label));
         }
@@ -2402,6 +2398,7 @@ static QDict *ia_handle_symbolize_memory(int64_t id, QDict *params)
     int64_t size;
     CPUState *cpu;
     CPUArchState *env;
+    uint64_t base_offset;
     uint64_t pc;
     QList *bytes = qlist_new();
     g_autofree char *norm_addr = NULL;
@@ -2441,10 +2438,13 @@ static QDict *ia_handle_symbolize_memory(int64_t id, QDict *params)
     }
     cpu = ia_state.current_cpu;
     env = (CPUArchState *)cpu->env_ptr;
+    base_offset = ia_state.symbolic_input_next_offset;
+    ia_state.symbolic_input_next_offset += (uint64_t)size;
     pc = get_pc(env);
     qemu_mutex_unlock(&ia_state.lock);
 
-    if (!ia_symbolize_guest_memory(cpu, addr, (size_t)size, pc, bytes)) {
+    if (!ia_symbolize_guest_memory(cpu, addr, (size_t)size, base_offset, pc,
+                                   bytes)) {
         qobject_unref(bytes);
         qobject_unref(result);
         return ia_make_error_response(id, "invalid_address",
@@ -2506,8 +2506,8 @@ static QDict *ia_handle_symbolize_register(int64_t id, QDict *params)
         return ia_make_error_response(id, "invalid_params",
                                       "register is not supported for symbolization");
     }
-    base_offset = ia_state.symbolic_value_next_offset;
-    ia_state.symbolic_value_next_offset += MAX(1u, width_bits / 8);
+    base_offset = ia_state.symbolic_input_next_offset;
+    ia_state.symbolic_input_next_offset += MAX(1u, width_bits / 8);
     qemu_mutex_unlock(&ia_state.lock);
 
     reg_label = ia_create_symbolic_value_label(width_bits, base_offset, value, get_pc(env));
