@@ -81,6 +81,7 @@ int dfsan_region_is_concrete(const void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
                         u64 op1, u64 op2, u64 pc);
 dfsan_label dfsan_create_label(off_t offset);
+dfsan_label dfsan_create_label_with_value(off_t offset, u8 value);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
 int dfsan_is_branch_condition_label(dfsan_label label);
@@ -125,6 +126,11 @@ int dfsan_query_value_eq(dfsan_label label, uint64_t target,
                          uptr assignment_capacity, uptr *assignment_count,
                          uptr *assumption_count,
                          char *error, uptr error_capacity);
+
+void dfsan_begin_value_solver_capture(void);
+int dfsan_export_value_solver(dfsan_label label, char *json_out,
+                              uptr json_capacity, uptr *json_len,
+                              char *error, uptr error_capacity);
 
 // taint source
 void taint_set_file(const char *filename, int fd);
@@ -237,7 +243,7 @@ enum operators {
   // higher-order
   fmemcmp   = last_llvm_op + 7,
   fsize     = last_llvm_op + 8,
-  /* last_llvm_op + 9 was previously reserved for LoadAddr */
+  LoadAddr  = last_llvm_op + 9,
   Ite       = last_llvm_op + 10,
 };
 

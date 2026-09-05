@@ -190,6 +190,7 @@ const char* get_op_name(u16 op, u64 pred) {
         case 2:     return "Neg"; // Neg
         case Extract: return "Extract";
         case Concat:  return "Concat";
+        case LoadAddr: return "LoadAddr";
         case Ite:     return "If-Then-Else";
         //case Equal:   return "Equal"; // This opcode was eliminated from this branch
         case fmemcmp: return "memcmp_func";
@@ -383,8 +384,8 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
     if (op != Extract) return 0;
   }
 
-  // special handling for bounds, which may use all four fields
-  if (op != Alloca) {
+  // special handling for bounds and symbolic-address loads, which use op1/op2.
+  if (op != Alloca && op != LoadAddr) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
@@ -602,12 +603,10 @@ dfsan_label __taint_union_load(const dfsan_label *ls, const void *addr, uptr n) 
         return __taint_union(label, trunc, Concat, n * 8, 0, 0, __dfsan_label_info[label0].pc); // Which PC value should we be using here? label0?
       }
     } else {
-      // Report("WARNING: taint mixed with concrete %d %p\n", i, &ls[i]);
-      // symqemu: disable app_for for now.
-      // char *c = (char *)app_for(&ls[i]);
+      const u8 concrete = reinterpret_cast<const u8 *>(addr)[i];
       ++i;
-      // label = __taint_union(label, 0, Concat, i * 8, 0, *c);
-      label = __taint_union(label, 0, Concat, i * 8, 0, 0, __dfsan_label_info[label0].pc);
+      label = __taint_union(label, 0, Concat, i * 8, 0, concrete,
+                            __dfsan_label_info[label0].pc);
     }
   }
   AOUT("\n");
@@ -813,6 +812,13 @@ dfsan_label dfsan_create_label(off_t offset) {
   __dfsan_label_info[label].op1.i = offset;
   // init a non-zero hash
   __dfsan_label_info[label].hash = xxhash(offset, 0, 8);
+  return label;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label dfsan_create_label_with_value(off_t offset, u8 value) {
+  dfsan_label label = dfsan_create_label(offset);
+  __dfsan_label_info[label].op2.i = value;
   return label;
 }
 
@@ -1293,7 +1299,7 @@ extern "C" {
 // Default empty implementations (weak) for hooks
 // SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
 //                              u32, u32, u64, u64, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u32) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u64) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}

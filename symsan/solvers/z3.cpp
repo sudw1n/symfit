@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <sstream>
 
 #define OPTIMISTIC 1
 
@@ -32,10 +33,10 @@ static z3::solver __z3_solver(__z3_context, "QF_BV");
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
 
 static std::unordered_set<dfsan_label> __solved_labels;
-typedef std::pair<u32, u32> trace_context;
+typedef std::pair<u32, u64> trace_context;
 struct context_hash {
   std::size_t operator()(const trace_context &context) const {
-    return std::hash<u32>{}(context.first) ^ std::hash<u32>{}(context.second);
+    return std::hash<u32>{}(context.first) ^ std::hash<u64>{}(context.second);
   }
 };
 static std::unordered_map<trace_context, u16, context_hash> __branches;
@@ -47,6 +48,7 @@ static std::unordered_set<uptr> __buffers;
 static std::unordered_map<dfsan_label, u32> tsize_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<u32> > deps_cache;
 static std::unordered_map<dfsan_label, z3::expr> expr_cache;
+static std::unordered_map<u32, u8> input_seed;
 
 // dependencies
 struct expr_hash {
@@ -72,9 +74,12 @@ typedef struct {
 typedef struct {
   dfsan_label label;
   bool taken;
+  u64 pc;
+  u64 seq;
 } recorded_branch_t;
 static std::vector<branch_dep_t*> __branch_deps;
 static std::vector<recorded_branch_t> __recorded_branches;
+static u64 __recorded_branch_seq = 0;
 
 static inline branch_dep_t* get_branch_dep(size_t n) {
   if (n >= __branch_deps.size()) {
@@ -98,6 +103,29 @@ enum class SerializeMode {
 static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
                           SerializeMode mode);
 static z3::expr direction_expr(const z3::expr &cond, bool taken);
+
+static bool matches_observed_value(const z3::expr &expr,
+                                   const std::unordered_set<u32> &deps,
+                                   u64 observed) {
+  z3::expr_vector from(__z3_context);
+  z3::expr_vector to(__z3_context);
+  for (u32 offset : deps) {
+    auto it = input_seed.find(offset);
+    if (it == input_seed.end()) {
+      return false;
+    }
+    std::string name = "symfit_input_" + std::to_string(offset);
+    from.push_back(__z3_context.constant(
+        __z3_context.str_symbol(name.c_str()), __z3_context.bv_sort(8)));
+    to.push_back(__z3_context.bv_val(it->second, 8));
+  }
+  z3::expr candidate = expr;
+  z3::expr concrete = candidate.substitute(from, to).simplify();
+  uint64_t value = 0;
+  return concrete.is_bv() && concrete.is_numeral() &&
+         Z3_get_numeral_uint64(__z3_context, concrete, &value) &&
+         value == observed;
+}
 
 static inline expr_set_t take_load_expr_deps() {
   expr_set_t out;
@@ -520,19 +548,20 @@ static bool collect_recorded_constraint_context(
   return true;
 }
 
-static void record_branch_inputs(dfsan_label label, bool taken) {
+static void record_branch_inputs(dfsan_label label, bool taken, u64 pc) {
   std::unordered_set<u32> inputs;
 
   if (!dfsan_is_branch_condition_label(label)) {
     return;
   }
 
+  __recorded_branches.push_back({label, taken, pc, __recorded_branch_seq++});
+
   try {
     serialize(label, inputs, SerializeMode::Format);
   } catch (z3::exception const &) {
     return;
   }
-  __recorded_branches.push_back({label, taken});
 
   for (auto off : inputs) {
     auto c = get_branch_dep(off);
@@ -680,12 +709,84 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
   // special ops
   if (info->op == 0) {
     // input
-    z3::symbol symbol = __z3_context.int_symbol(info->op1.i);
+    std::string input_name = "symfit_input_" + std::to_string(info->op1.i);
+    z3::symbol symbol = __z3_context.str_symbol(input_name.c_str());
     z3::sort sort = __z3_context.bv_sort(8);
     tsize_cache[label] = 1; // lazy init
     deps.insert(info->op1.i);
+    input_seed[info->op1.i] = static_cast<u8>(info->op2.i);
     // caching is not super helpful
     return __z3_context.constant(symbol, sort);
+  } else if (info->op == LoadAddr) {
+    std::unordered_set<u32> addr_deps;
+    z3::expr addr = serialize(info->l1, addr_deps, mode).simplify();
+    if (!addr.is_bv()) {
+      throw z3::exception("symbolic load address is not a bit-vector");
+    }
+
+    if (mode == SerializeMode::Format) {
+      std::string addr_rendered = format_simplified_expr(addr, 0);
+      z3::symbol load_symbol =
+          __z3_context.str_symbol(
+              make_display_load_name(info->size, addr_rendered).c_str());
+      if (matches_observed_value(addr, addr_deps, info->op1.i)) {
+        deps.insert(addr_deps.begin(), addr_deps.end());
+      }
+      if (info->l2 >= CONST_OFFSET) {
+        std::unordered_set<u32> content_deps;
+        serialize(info->l2, content_deps, mode);
+        deps.insert(content_deps.begin(), content_deps.end());
+      }
+      tsize_cache[label] = 1;
+      return cache_expr(label,
+                        __z3_context.constant(
+                            load_symbol, __z3_context.bv_sort(info->size)),
+                        deps, mode);
+    }
+
+    if (!matches_observed_value(addr, addr_deps, info->op1.i)) {
+      z3::expr out = __z3_context.bv_val(
+          static_cast<uint64_t>(info->op2.i), info->size);
+      if (info->l2 >= CONST_OFFSET) {
+        out = serialize(info->l2, deps, mode).simplify();
+      }
+      tsize_cache[label] = 1;
+      return cache_expr(label, out, deps, mode);
+    }
+    deps.insert(addr_deps.begin(), addr_deps.end());
+
+    if (__collect_load_expr_deps) {
+      __load_expr_deps.insert(
+          addr == __z3_context.bv_val(static_cast<uint64_t>(info->op1.i),
+                                      addr.get_sort().bv_size()));
+    }
+    if (__collect_solve_assumptions) {
+      dfsan_solve_assumption assumption = {};
+      assumption.load_label = label;
+      assumption.addr_label = info->l1;
+      assumption.concrete_addr = info->op1.i;
+      assumption.concrete_value = info->op2.i;
+      assumption.pc = info->pc;
+      assumption.size = info->size;
+      __solve_assumptions.push_back(assumption);
+    }
+
+    z3::expr out = __z3_context.bv_val(static_cast<uint64_t>(info->op2.i),
+                                       info->size);
+    if (info->l2 >= CONST_OFFSET) {
+      out = serialize(info->l2, deps, mode).simplify();
+      if (!out.is_bv()) {
+        throw z3::exception("symbolic load value is not a bit-vector");
+      }
+      unsigned value_width = out.get_sort().bv_size();
+      if (value_width > info->size) {
+        out = out.extract(info->size - 1, 0);
+      } else if (value_width < info->size) {
+        out = z3::zext(out, info->size - value_width);
+      }
+    }
+    tsize_cache[label] = 1;
+    return cache_expr(label, out, deps, mode);
   } else if (info->op == Load) {
     dfsan_label addr_label = 0;
     uint64_t concrete_addr = 0;
@@ -732,14 +833,19 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
       }
     } else {
       u64 offset = get_label_info(info->l1)->op1.i;
-      z3::symbol symbol = __z3_context.int_symbol(offset);
+      std::string name = "symfit_input_" + std::to_string(offset);
+      z3::symbol symbol = __z3_context.str_symbol(name.c_str());
       z3::sort sort = __z3_context.bv_sort(8);
       out = __z3_context.constant(symbol, sort);
       deps.insert(offset);
+      input_seed[offset] = static_cast<u8>(get_label_info(info->l1)->op2.i);
       for (u32 i = 1; i < info->l2; i++) {
-        symbol = __z3_context.int_symbol(offset + i);
+        name = "symfit_input_" + std::to_string(offset + i);
+        symbol = __z3_context.str_symbol(name.c_str());
         out = z3::concat(__z3_context.constant(symbol, sort), out);
         deps.insert(offset + i);
+        input_seed[offset + i] =
+            static_cast<u8>(get_label_info(info->l1 + i)->op2.i);
       }
     }
     tsize_cache[label] = 1; // lazy init
@@ -759,10 +865,18 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
     return cache_expr(label, z3::sext(base, info->size - base_size), deps, mode);
   } else if (info->op == Trunc) {
     z3::expr base = serialize(info->l1, deps, mode);
+    if (!base.is_bv() || info->size == 0 ||
+        info->size > base.get_sort().bv_size()) {
+      throw z3::exception("invalid trunc width");
+    }
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract(info->size - 1, 0), deps, mode);
   } else if (info->op == Extract) {
     z3::expr base = serialize(info->l1, deps, mode);
+    if (!base.is_bv() || info->size == 0 ||
+        info->op2.i + info->size > base.get_sort().bv_size()) {
+      throw z3::exception("invalid extract width or offset");
+    }
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps, mode);
   } else if (info->op == Not) {
@@ -1076,16 +1190,17 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
        op1, op2, size, predicate, c1, c2, cid, addr);
 
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2, cid);
-  record_branch_inputs(temp, eval_cmp_taken(predicate, size, c1, c2));
   return temp;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
+__taint_trace_cond(dfsan_label label, u8 r, u64 cid) {
   if (label == 0)
     return;
 
   void *addr = __builtin_return_address(0);
+  record_branch_inputs(label, r != 0, cid);
+
   auto itr = __branches.find({__taint_trace_callstack, cid});
   if (itr == __branches.end()) {
     itr = __branches.insert({{__taint_trace_callstack, cid}, 1}).first;
@@ -1095,10 +1210,22 @@ __taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
     return;
   }
 
-  AOUT("recording cond: %u %u 0x%x 0x%x %p %u\n",
-       label, r, __taint_trace_callstack, cid, addr, itr->second);
+  AOUT("recording cond: %u %u 0x%x 0x%llx %p %u\n",
+       label, r, __taint_trace_callstack, (unsigned long long)cid, addr,
+       itr->second);
+}
 
-  record_branch_inputs(label, r != 0);
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+dfsan_begin_value_solver_capture(void) {
+  for (auto dep : __branch_deps) {
+    delete dep;
+  }
+  __branch_deps.clear();
+  __recorded_branches.clear();
+  __recorded_branch_seq = 0;
+  __branches.clear();
+  deps_cache.clear();
+  expr_cache.clear();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
@@ -1364,6 +1491,218 @@ static void copy_solve_text(const std::string &text, char *out,
   }
   internal_memcpy(out, text.data(), n);
   out[n] = '\0';
+}
+
+static std::string hex_u64(u64 value) {
+  std::ostringstream out;
+  out << "0x" << std::hex << value;
+  return out.str();
+}
+
+static void append_json_string(std::ostringstream &out,
+                               const std::string &value) {
+  out << '"';
+  for (char ch : value) {
+    unsigned char uch = static_cast<unsigned char>(ch);
+    switch (ch) {
+    case '\\': out << "\\\\"; break;
+    case '"': out << "\\\""; break;
+    case '\n': out << "\\n"; break;
+    case '\r': out << "\\r"; break;
+    case '\t': out << "\\t"; break;
+    default:
+      if (uch < 0x20) {
+        out << "\\u00";
+        const char *hex = "0123456789abcdef";
+        out << hex[(uch >> 4) & 0xf] << hex[uch & 0xf];
+      } else {
+        out << ch;
+      }
+    }
+  }
+  out << '"';
+}
+
+static void append_input_array(std::ostringstream &out,
+                               const std::unordered_set<u32> &inputs) {
+  std::vector<u32> sorted(inputs.begin(), inputs.end());
+  std::sort(sorted.begin(), sorted.end());
+  out << '[';
+  for (size_t i = 0; i < sorted.size(); i++) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << sorted[i];
+  }
+  out << ']';
+}
+
+static std::unordered_set<u32> label_inputs_or_throw(dfsan_label label) {
+  std::unordered_set<u32> inputs;
+  serialize(label, inputs, SerializeMode::Format);
+  return inputs;
+}
+
+static std::vector<size_t>
+select_relevant_branch_events(dfsan_label target_label,
+                              std::unordered_set<u32> &relevant_inputs,
+                              std::vector<std::unordered_set<u32>> &branch_inputs) {
+  std::vector<uint8_t> selected(__recorded_branches.size(), 0);
+  std::vector<size_t> order;
+  bool changed = true;
+
+  branch_inputs.resize(__recorded_branches.size());
+  while (changed) {
+    changed = false;
+    for (size_t i = 0; i < __recorded_branches.size(); i++) {
+      if (selected[i] || __recorded_branches[i].label == target_label) {
+        continue;
+      }
+      if (branch_inputs[i].empty()) {
+        branch_inputs[i] = label_inputs_or_throw(__recorded_branches[i].label);
+      }
+      if (!inputs_overlap(relevant_inputs, branch_inputs[i])) {
+        continue;
+      }
+
+      selected[i] = 1;
+      order.push_back(i);
+      for (auto input : branch_inputs[i]) {
+        if (relevant_inputs.insert(input).second) {
+          changed = true;
+        }
+      }
+    }
+  }
+  std::sort(order.begin(), order.end());
+  return order;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_export_value_solver(dfsan_label label, char *json_out,
+                          uptr json_capacity, uptr *json_len,
+                          char *error, uptr error_capacity) {
+  if (json_len != nullptr) {
+    *json_len = 0;
+  }
+  if (error != nullptr && error_capacity != 0) {
+    error[0] = '\0';
+  }
+  if (label == 0) {
+    copy_solve_error("label is zero", error, error_capacity);
+    return -1;
+  }
+
+  try {
+    __z3_solver.reset();
+    __z3_solver.set("timeout", 5000U);
+    begin_solve_assumption_collection();
+
+    std::unordered_set<u32> target_inputs;
+    begin_load_expr_dep_collection();
+    z3::expr target = serialize(label, target_inputs, SerializeMode::Solve);
+    expr_set_t target_load_deps = take_load_expr_deps();
+    if (!target.is_bv()) {
+      take_solve_assumptions();
+      copy_solve_error("target label is not a bit-vector", error,
+                       error_capacity);
+      return -1;
+    }
+
+    std::unordered_set<u32> relevant_inputs = target_inputs;
+    std::vector<std::unordered_set<u32>> branch_inputs;
+    std::vector<size_t> selected =
+        select_relevant_branch_events(label, relevant_inputs, branch_inputs);
+
+    expr_set_t added;
+    for (auto &expr : target_load_deps) {
+      if (added.insert(expr).second) {
+        __z3_solver.add(expr);
+      }
+    }
+
+    for (auto idx : selected) {
+      const auto &event = __recorded_branches[idx];
+      std::unordered_set<u32> deps;
+      begin_load_expr_dep_collection();
+      z3::expr cond = serialize(event.label, deps, SerializeMode::Solve);
+      expr_set_t load_deps = take_load_expr_deps();
+      z3::expr assertion = direction_expr(cond, event.taken);
+      __z3_solver.add(assertion);
+      for (auto &expr : load_deps) {
+        if (added.insert(expr).second) {
+          __z3_solver.add(expr);
+        }
+      }
+    }
+
+    z3::expr target_sym =
+        __z3_context.constant(__z3_context.str_symbol("symfit_target"),
+                              target.get_sort());
+    __z3_solver.add(target_sym == target);
+
+    std::vector<dfsan_solve_assumption> assumptions =
+        take_solve_assumptions();
+    std::string smt2 = __z3_solver.to_smt2();
+
+    std::ostringstream json;
+    json << "{\"export_kind\":\"value_solver_export_v2\",";
+    json << "\"complete\":true,";
+    json << "\"target\":{\"label\":";
+    append_json_string(json, hex_u64(label));
+    json << ",\"symbol\":\"symfit_target\",\"size\":"
+         << target.get_sort().bv_size() << ",\"input_offsets\":";
+    append_input_array(json, target_inputs);
+    json << "},\"path\":{\"selection\":\"fixed_point_transitive_input_overlap\",";
+    json << "\"recorded_branch_count\":" << __recorded_branches.size() << ',';
+    json << "\"constraint_count\":" << selected.size() << ',';
+    json << "\"relevant_input_offsets\":";
+    append_input_array(json, relevant_inputs);
+    json << ",\"constraints\":[";
+    for (size_t n = 0; n < selected.size(); n++) {
+      const auto &event = __recorded_branches[selected[n]];
+      if (n != 0) {
+        json << ',';
+      }
+      json << "{\"seq\":" << event.seq << ",\"pc\":";
+      append_json_string(json, hex_u64(event.pc));
+      json << ",\"label\":";
+      append_json_string(json, hex_u64(event.label));
+      json << ",\"taken\":" << (event.taken ? "true" : "false");
+      json << ",\"input_offsets\":";
+      append_input_array(json, branch_inputs[selected[n]]);
+      json << '}';
+    }
+    json << "]},\"assumptions\":[";
+    for (size_t i = 0; i < assumptions.size(); i++) {
+      const auto &assumption = assumptions[i];
+      if (i != 0) {
+        json << ',';
+      }
+      json << "{\"kind\":\"concretized_symbolic_load\",\"load_label\":";
+      append_json_string(json, hex_u64(assumption.load_label));
+      json << ",\"addr_label\":";
+      append_json_string(json, hex_u64(assumption.addr_label));
+      json << ",\"concrete_address\":";
+      append_json_string(json, hex_u64(assumption.concrete_addr));
+      json << ",\"concrete_value\":";
+      append_json_string(json, hex_u64(assumption.concrete_value));
+      json << ",\"pc\":";
+      append_json_string(json, hex_u64(assumption.pc));
+      json << ",\"size\":" << assumption.size << '}';
+    }
+    json << "],\"smt2\":";
+    append_json_string(json, smt2);
+    json << '}';
+
+    copy_solve_text(json.str(), json_out, json_capacity, json_len);
+    return 1;
+  } catch (z3::exception const &e) {
+    take_load_expr_deps();
+    take_solve_assumptions();
+    copy_solve_error(e.msg(), error, error_capacity);
+    return -1;
+  }
 }
 
 // Rebuilds the __z3_solver context for `label` exactly as

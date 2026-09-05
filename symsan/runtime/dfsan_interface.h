@@ -45,7 +45,7 @@ enum operators {
   // higher-order
   fmemcmp   = last_llvm_op + 7,
   fsize     = last_llvm_op + 8,
-  /* last_llvm_op + 9 was previously reserved for LoadAddr */
+  LoadAddr  = last_llvm_op + 9,
   Ite       = last_llvm_op + 10,
 };
 
@@ -75,6 +75,7 @@ dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
 
 /// Creates and returns a base label with the given description and user data.
 dfsan_label dfsan_create_label(int pos);
+dfsan_label dfsan_create_label_with_value(int pos, u8 value);
   
 /// Sets the label for each address in [addr,addr+size) to \c label.
 void dfsan_set_label(dfsan_label label, void *addr, size_t size, u64 pc);
@@ -125,6 +126,7 @@ void dfsan_unimplemented(char *fname);
 
 dfsan_label __taint_trace_cmp(dfsan_label l1, dfsan_label l2, u8 size, u32 predicate,
                        u64 op1, u64 op2, u32 cid);
+void __taint_trace_cond(dfsan_label label, u8 r, u64 cid);
 
 int dfsan_is_branch_condition_label(dfsan_label label);
 int dfsan_get_branch_direction(dfsan_label label, uint8_t *taken);
@@ -168,6 +170,11 @@ int dfsan_query_value_eq(dfsan_label label, uint64_t target,
                          size_t assignment_capacity, size_t *assignment_count,
                          size_t *assumption_count,
                          char *error, size_t error_capacity);
+
+void dfsan_begin_value_solver_capture(void);
+int dfsan_export_value_solver(dfsan_label label, char *json_out,
+                              size_t json_capacity, size_t *json_len,
+                              char *error, size_t error_capacity);
 
 
 void addContextRecording(u64 func_addr);

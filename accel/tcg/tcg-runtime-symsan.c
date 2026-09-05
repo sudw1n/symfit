@@ -13,6 +13,8 @@
 #include "sysemu/sysemu.h"
 extern CPUArchState *global_env;
 #define CONST_LABEL 0
+#define SYMSAN_OP_LOADADDR ((uint16_t)(Ite - 1))
+
 
 static target_ulong get_pc(CPUArchState *env)
 {
@@ -202,30 +204,6 @@ bool symsan_find_load_metadata_for_label(dfsan_label load_label,
     }
 
     return false;
-}
-
-static dfsan_label symsan_find_load_root_label(dfsan_label value_label)
-{
-    SymsanRuntimeLabelInfo *info;
-
-    if (value_label == 0) {
-        return 0;
-    }
-
-    info = dfsan_get_label_info(value_label);
-    if (!info) {
-        return 0;
-    }
-    if ((info->op & 0xff) == Load) {
-        return value_label;
-    }
-    if ((info->op & 0xff) == ZExt && info->l1 != 0) {
-        SymsanRuntimeLabelInfo *child = dfsan_get_label_info(info->l1);
-        if (child && ((child->op & 0xff) == Load)) {
-            return info->l1;
-        }
-    }
-    return 0;
 }
 
 static uint64_t symsan_read_concrete_load_value(const void *host_addr,
@@ -841,7 +819,7 @@ uint64_t HELPER(symsan_extract_i32)(uint32_t arg, uint64_t arg_label, uint32_t o
        ofs is the offset to start extract.
      */
     CPUArchState *env = current_cpu->env_ptr;
-    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, 32, ofs + len - 1, ofs, get_pc(env));
+    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, len, ofs + len - 1, ofs, get_pc(env));
     return dfsan_union(out, CONST_LABEL, ZExt, 32, 0, 32 - len, get_pc(env));
 }
 uint64_t HELPER(symsan_extract_i64)(uint64_t arg, uint64_t arg_label, uint64_t ofs, uint64_t len)
@@ -851,7 +829,7 @@ uint64_t HELPER(symsan_extract_i64)(uint64_t arg, uint64_t arg_label, uint64_t o
        ofs is the offset to start extract.
      */
     CPUArchState *env = current_cpu->env_ptr;
-    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, 64, ofs + len - 1, ofs, get_pc(env));
+    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, len, ofs + len - 1, ofs, get_pc(env));
     return dfsan_union(out, CONST_LABEL, ZExt, 64, 0, 64 - len, get_pc(env));
 }
 
@@ -862,7 +840,7 @@ uint64_t HELPER(symsan_sextract_i32)(uint32_t arg, uint64_t arg_label, uint32_t 
        ofs is the offset to start extract.
      */
     CPUArchState *env = current_cpu->env_ptr;
-    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, 32, ofs + len - 1, ofs, get_pc(env));
+    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, len, ofs + len - 1, ofs, get_pc(env));
     return dfsan_union(out, CONST_LABEL, SExt, 32, 0, 32 - len, get_pc(env));
 }
 uint64_t HELPER(symsan_sextract_i64)(uint64_t arg, uint64_t arg_label, uint64_t ofs, uint64_t len)
@@ -872,7 +850,7 @@ uint64_t HELPER(symsan_sextract_i64)(uint64_t arg, uint64_t arg_label, uint64_t 
        ofs is the offset to start extract.
      */
     CPUArchState *env = current_cpu->env_ptr;
-    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, 64, ofs + len - 1, ofs, get_pc(env));
+    uint32_t out = dfsan_union(arg_label, CONST_LABEL, Extract, len, ofs + len - 1, ofs, get_pc(env));
     return dfsan_union(out, CONST_LABEL, SExt, 64, 0, 64 - len, get_pc(env));
 }
 
@@ -1010,9 +988,6 @@ static uint64_t symsan_setcond_internal(CPUArchState *env, uint64_t arg1, uint64
         dfsan_label cmp_label =
             dfsan_union(arg1_label, arg2_label, (predicate << 8) | ICmp,
                         result_bits, arg1, arg2, get_pc(env));
-        // Changed to architecture-independent program counter from env->eip
-        __taint_trace_cmp(arg1_label, arg2_label, result_bits, predicate,
-                          arg1, arg2, get_pc(env));
         label = dfsan_union(cmp_label, CONST_LABEL, Ite,
                             result_bits, 0, 0, get_pc(env));
         if (symsan_debug_path_constraints_enabled()) {
@@ -1020,9 +995,6 @@ static uint64_t symsan_setcond_internal(CPUArchState *env, uint64_t arg1, uint64
                     "[ia-pc] traced pc=0x%lx cmp=0x%x ite=0x%x taken=%lu predicate=%u\n",
                     (unsigned long)get_pc(env), cmp_label, label,
                     (unsigned long)(result != 0), predicate);
-        }
-        if (cmp_label != 0) {
-            symsan_record_path_constraint(get_pc(env), cmp_label, result != 0);
         }
     }
     return label;
@@ -1157,11 +1129,6 @@ static uint64_t symsan_load_guest_internal(CPUArchState *env, target_ulong addr,
     if (addr_label) {
         dfsan_label load_label = 0;
 
-        /*
-         * Preserve content-based precision when the memory bytes are already
-         * symbolic. Otherwise, create a first-class Load label so the result
-         * remains symbolic and the side metadata can drive formatting/solving.
-         */
         if (res_label != 0) {
             if (is_stack_addr(addr, env)) {
                 target_ulong sp = get_stack_pointer(env);
@@ -1190,12 +1157,18 @@ static uint64_t symsan_load_guest_internal(CPUArchState *env, target_ulong addr,
                 fprintf(stderr, "[SYMBOLIC_LOAD] addr=0x%lx SP%s0x%llx FP%s0x%llx label=%lu size=%ld PC=0x%llx\n",
                         addr, (sp_offset >= 0) ? "+" : "-", (unsigned long long) abs(sp_offset), (fp_offset >=0) ? "+" : "-", (unsigned long long) abs(fp_offset), res_label, load_length, get_pc(env));
         }
-            load_label = symsan_find_load_root_label(res_label);
+            load_label = dfsan_union(addr_label, (dfsan_label)res_label,
+                                     SYMSAN_OP_LOADADDR, load_length * 8, addr,
+                                     concrete_value, get_pc(env));
         } else if (load_length > 0 && load_length <= UINT16_MAX) {
-            load_label = dfsan_union(addr_label, (dfsan_label)load_length,
-                                     Load, load_length * 8, 0, 0, get_pc(env));
-            if (load_label != 0 && load_length < 8) {
-                res_label = dfsan_union(load_label, CONST_LABEL, ZExt, 64, 0, 0, get_pc(env));
+            load_label = dfsan_union(addr_label, CONST_LABEL, SYMSAN_OP_LOADADDR,
+                                     load_length * 8, addr, concrete_value,
+                                     get_pc(env));
+        }
+        if (load_label != 0) {
+            if (load_length < 8 && result_length == 8) {
+                res_label = dfsan_union(load_label, CONST_LABEL, ZExt, 64,
+                                        0, 0, get_pc(env));
             } else {
                 res_label = load_label;
             }
@@ -1297,13 +1270,6 @@ static void symsan_store_guest_internal(CPUArchState *env, uint64_t value_label,
                     (fp_offset >=0) ? "+" : "-", (unsigned long long) abs(fp_offset), (sp_offset >= 0) ? "+" : "-", (unsigned long long) abs(sp_offset),  value_label, length, get_pc(env));
     }
     
-    if (addr_label) {
-        // fprintf(stderr, "sym store addr 0x%lx eip 0x%lx\n", addr, env->eip);
-        dfsan_label addr_label_new = \
-            dfsan_union(addr_label, CONST_LABEL, bveq, 64, addr, 0, get_pc(env));
-        __taint_trace_cmp(addr_label_new, CONST_LABEL, 64, bveq, 0, 0, get_pc(env));
-    }
-
     dfsan_store_label(value_label, (uint8_t*)host_addr, length, get_pc(env));
     // g_assert_not_reached();
 

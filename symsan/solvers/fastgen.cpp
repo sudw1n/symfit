@@ -59,7 +59,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .id = cid,
+    .id = (u32)cid,
     .label = label,
     .result = result
   };
@@ -87,7 +87,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
+__taint_trace_cond(dfsan_label label, u8 r, u64 cid) {
   if (label == 0)
     return;
 
