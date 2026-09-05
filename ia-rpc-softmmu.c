@@ -43,7 +43,17 @@ typedef struct IADfsanLabelInfo {
     uint16_t op;
     uint16_t size;
     uint32_t hash;
+    uint64_t pc;
 } __attribute__((aligned(8), packed)) IADfsanLabelInfo;
+
+#define IA_OP_LOADADDR ((uint16_t)(Ite - 1))
+
+typedef struct IAPathConstraintEntry {
+    uint64_t pc;
+    dfsan_label label;
+    bool taken;
+    bool exportable;
+} IAPathConstraintEntry;
 
 #ifndef DFSAN_SOLVE_PATH_CONSTRAINT_TYPES
 #define DFSAN_SOLVE_PATH_CONSTRAINT_TYPES
@@ -93,6 +103,10 @@ extern int __attribute__((weak)) dfsan_get_path_constraint_text(
     dfsan_label label, uint8_t desired_taken, uint8_t want_evaluated,
     char *smt2_out, size_t smt2_capacity, size_t *smt2_len,
     char *evaluated_out, size_t evaluated_capacity, size_t *evaluated_len,
+    char *error, size_t error_capacity);
+extern void __attribute__((weak)) dfsan_begin_value_solver_capture(void);
+extern int __attribute__((weak)) dfsan_export_value_solver(
+    dfsan_label label, char *json_out, size_t json_capacity, size_t *json_len,
     char *error, size_t error_capacity);
 #pragma GCC diagnostic pop
 
@@ -158,14 +172,7 @@ typedef struct IAState {
     FILE *trace_file;
     char *trace_path;
     uint64_t trace_seq;
-    struct {
-        uint64_t pc;
-        dfsan_label label;
-        bool taken;
-        bool exportable;
-    } path_constraints[256];
-    size_t path_constraints_head;
-    size_t path_constraints_count;
+    GArray *path_constraints;
     uint64_t symbolic_input_next_offset;
     QemuThread server_thread;
 } IAState;
@@ -454,6 +461,7 @@ static const char *ia_label_op_name(uint16_t op)
     case ICmp: return "ICmp";
     case Alloca: return "Alloca";
     case Load: return "Load";
+    case IA_OP_LOADADDR: return "LoadAddr";
     case Extract: return "Extract";
     case Concat: return "Concat";
     case Arg: return "Arg";
@@ -521,15 +529,33 @@ static QDict *ia_make_symbolic_label_entry(dfsan_label label)
         qdict_put_int(entry, "op1", info->op1.i);
         qdict_put_int(entry, "op2", info->op2.i);
 
-        if ((info->op & 0xff) == Load) {
+        if ((info->op & 0xff) == Load || (info->op & 0xff) == IA_OP_LOADADDR) {
             dfsan_label addr_label = 0;
             target_ulong concrete_addr = 0;
             uint64_t concrete_value = 0;
             uint64_t pc = 0;
             QDict *load = qdict_new();
 
-            qdict_put_int(load, "byte_count", info->l2);
-            if (symsan_find_load_metadata_for_label(
+            qdict_put_int(load, "byte_count", info->size / 8);
+            if ((info->op & 0xff) == IA_OP_LOADADDR) {
+                g_autofree char *addr_label_hex =
+                    g_strdup_printf("0x%x", info->l1);
+                g_autofree char *content_label_hex =
+                    g_strdup_printf("0x%x", info->l2);
+                g_autofree char *concrete_addr_hex =
+                    g_strdup_printf("0x%" PRIx64, info->op1.i);
+                g_autofree char *concrete_value_hex =
+                    g_strdup_printf("0x%" PRIx64, info->op2.i);
+                g_autofree char *pc_hex =
+                    g_strdup_printf("0x%" PRIx64, info->pc);
+
+                qdict_put_str(load, "kind", "symbolic_address");
+                qdict_put_str(load, "address_label", addr_label_hex);
+                qdict_put_str(load, "content_label", content_label_hex);
+                qdict_put_str(load, "concrete_address", concrete_addr_hex);
+                qdict_put_str(load, "concrete_value", concrete_value_hex);
+                qdict_put_str(load, "pc", pc_hex);
+            } else if (symsan_find_load_metadata_for_label(
                     label, &addr_label, &concrete_addr, &concrete_value, &pc)) {
                 g_autofree char *addr_label_hex =
                     g_strdup_printf("0x%x", addr_label);
@@ -772,6 +798,11 @@ static bool ia_format_symbolic_expression_inner(GString *out, dfsan_label label,
         g_string_append_printf(out, "load_%s(", ia_c_int_type_name(info->size, false));
         ia_append_operand(out, info->l1, info->size, info->op1.i, depth);
         g_string_append_printf(out, ", %u)", info->l2);
+        return true;
+    case IA_OP_LOADADDR:
+        g_string_append_printf(out, "load_%s(", ia_c_int_type_name(info->size, false));
+        ia_append_operand(out, info->l1, 64, info->op1.i, depth);
+        g_string_append_printf(out, " == 0x%" PRIx64 ")", info->op1.i);
         return true;
     case Not:
         g_string_append(out, "(~");
@@ -1162,6 +1193,10 @@ static QDict *ia_handle_capabilities(int64_t id)
     qdict_put_bool(caps, "solve_path_constraints", dfsan_solve_path_constraint != NULL);
     qdict_put_bool(caps, "query_value_range", dfsan_query_value_range != NULL);
     qdict_put_bool(caps, "query_value_eq", dfsan_query_value_eq != NULL);
+    qdict_put_bool(caps, "begin_value_solver_capture",
+                   dfsan_begin_value_solver_capture != NULL);
+    qdict_put_bool(caps, "export_value_solver",
+                   dfsan_export_value_solver != NULL);
     qdict_put_bool(caps, "get_path_constraint_smt2", dfsan_get_path_constraint_text != NULL);
     qdict_put_bool(caps, "get_path_constraint_evaluated", dfsan_get_path_constraint_text != NULL);
     qdict_put_bool(caps, "queue_stdin_chunk", false);
@@ -1878,8 +1913,8 @@ static bool ia_symbolize_guest_memory(CPUState *cpu, uint64_t addr, size_t size,
             return false;
         }
         for (i = 0; i < chunk; i++) {
-            dfsan_label label =
-                dfsan_create_label((off_t)(base_offset + done + i));
+            dfsan_label label = dfsan_create_label_with_value(
+                (off_t)(base_offset + done + i), host[i]);
             dfsan_store_label(label, host + i, 1, pc);
             qlist_append(bytes, ia_make_symbolic_byte_entry(done + i, label));
         }
@@ -2036,6 +2071,7 @@ static QDict *ia_handle_read_symbolic_memory(int64_t id, QDict *params)
 
 static dfsan_label ia_create_symbolic_value_label(uint32_t width_bits,
                                                   uint64_t base_offset,
+                                                  uint64_t value,
                                                   uint64_t pc)
 {
     dfsan_label acc = 0;
@@ -2048,7 +2084,8 @@ static dfsan_label ia_create_symbolic_value_label(uint32_t width_bits,
 
     byte_count = width_bits / 8;
     for (i = 0; i < byte_count; i++) {
-        dfsan_label byte_label = dfsan_create_label((off_t)(base_offset + i));
+        dfsan_label byte_label = dfsan_create_label_with_value(
+            (off_t)(base_offset + i), (value >> (i * 8)) & 0xff);
 
         if (byte_label == 0) {
             return 0;
@@ -2184,7 +2221,8 @@ static QDict *ia_handle_symbolize_register(int64_t id, QDict *params)
     ia_state.symbolic_input_next_offset += MAX(1u, width_bits / 8);
     qemu_mutex_unlock(&ia_state.lock);
 
-    reg_label = ia_create_symbolic_value_label(width_bits, base_offset, get_pc(env));
+    reg_label = ia_create_symbolic_value_label(width_bits, base_offset, value,
+                                               get_pc(env));
     if (reg_label == 0) {
         qobject_unref(result);
         return ia_make_error_response(id, "internal_error",
@@ -2321,25 +2359,25 @@ static QDict *ia_handle_get_recent_path_constraints(int64_t id, QDict *params)
                                           "limit must be an integer");
         }
         limit = qdict_get_try_int(params, "limit", -1);
-        if (limit <= 0 || limit > 256) {
+        if (limit <= 0) {
             qobject_unref(entries);
             qobject_unref(result);
             return ia_make_error_response(id, "invalid_params",
-                                          "limit must be between 1 and 256");
+                                          "limit must be positive");
         }
     }
 
     qemu_mutex_lock(&ia_state.lock);
-    available = ia_state.path_constraints_count;
+    available = ia_state.path_constraints ? ia_state.path_constraints->len : 0;
     count = MIN((size_t)limit, available);
     for (i = 0; i < count; i++) {
-        size_t idx = (ia_state.path_constraints_head + 256 - 1 - i) % 256;
+        size_t idx = available - 1 - i;
+        IAPathConstraintEntry *entry =
+            &g_array_index(ia_state.path_constraints, IAPathConstraintEntry, idx);
 
         ia_append_path_constraint_entry(entries,
-                                        ia_state.path_constraints[idx].pc,
-                                        ia_state.path_constraints[idx].label,
-                                        ia_state.path_constraints[idx].taken,
-                                        ia_state.path_constraints[idx].exportable);
+                                        entry->pc, entry->label, entry->taken,
+                                        entry->exportable);
     }
     qemu_mutex_unlock(&ia_state.lock);
 
@@ -2592,6 +2630,91 @@ static QDict *ia_handle_get_path_constraint_smt2(int64_t id, QDict *params)
 static QDict *ia_handle_get_path_constraint_evaluated(int64_t id, QDict *params)
 {
     return ia_dump_path_constraint_common(id, params, true);
+}
+
+static QDict *ia_handle_begin_value_solver_capture(int64_t id)
+{
+    QDict *result = qdict_new();
+
+    if (!dfsan_begin_value_solver_capture) {
+        qobject_unref(result);
+        return ia_make_error_response(id, "unsupported",
+                                      "native value-solver capture is unavailable");
+    }
+
+    qemu_mutex_lock(&ia_state.lock);
+    if (!ia_inspection_available_locked()) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_state",
+                                      "backend must be paused before starting value-solver capture");
+    }
+    if (ia_state.path_constraints) {
+        g_array_set_size(ia_state.path_constraints, 0);
+    }
+    qemu_mutex_unlock(&ia_state.lock);
+
+    dfsan_begin_value_solver_capture();
+    qdict_put_str(result, "status", "started");
+    return ia_make_ok_response(id, result);
+}
+
+static QDict *ia_handle_export_value_solver(int64_t id, QDict *params)
+{
+    dfsan_label label;
+    size_t json_len = 0;
+    int rc;
+    char *json_buf = NULL;
+    char error[256] = { 0 };
+    Error *err = NULL;
+    QDict *result = NULL;
+
+    if (!params) {
+        return ia_make_error_response(id, "invalid_params", "params are required");
+    }
+    if (!ia_parse_label_param(params, "label", &label, &err)) {
+        const char *message = error_get_pretty(err);
+        QDict *resp = ia_make_error_response(id, "invalid_params", message);
+        error_free(err);
+        return resp;
+    }
+    if (label == 0 || label > dfsan_get_label_count() || !dfsan_get_label_info(label)) {
+        return ia_make_error_response(id, "invalid_params", "label is not valid");
+    }
+    if (!dfsan_export_value_solver) {
+        return ia_make_error_response(id, "unsupported",
+                                      "native value-solver export is unavailable");
+    }
+
+    qemu_mutex_lock(&ia_state.lock);
+    if (!ia_inspection_available_locked()) {
+        qemu_mutex_unlock(&ia_state.lock);
+        return ia_make_error_response(id, "invalid_state",
+                                      "backend must be paused before exporting value-solver state");
+    }
+    qemu_mutex_unlock(&ia_state.lock);
+
+    rc = dfsan_export_value_solver(label, NULL, 0, &json_len,
+                                   error, sizeof(error));
+    if (rc < 0) {
+        return ia_make_error_response(id, "solver_error",
+                                      error[0] ? error : "value-solver export failed");
+    }
+
+    json_buf = g_malloc(json_len + 1);
+    rc = dfsan_export_value_solver(label, json_buf, json_len + 1, &json_len,
+                                   error, sizeof(error));
+    if (rc < 0) {
+        g_free(json_buf);
+        return ia_make_error_response(id, "solver_error",
+                                      error[0] ? error : "value-solver export failed");
+    }
+
+    result = qdict_new();
+    qdict_put_str(result, "export_json", json_buf ? json_buf : "");
+    qdict_put_int(result, "export_json_len", json_len);
+    g_free(json_buf);
+    return ia_make_ok_response(id, result);
 }
 
 /* Parse a 64-bit unsigned value that may arrive either as a JSON integer or as
@@ -3129,6 +3252,12 @@ static QDict *ia_dispatch_request(QDict *request)
     if (strcmp(method, "get_path_constraint_evaluated") == 0) {
         return ia_handle_get_path_constraint_evaluated(id, params);
     }
+    if (strcmp(method, "begin_value_solver_capture") == 0) {
+        return ia_handle_begin_value_solver_capture(id);
+    }
+    if (strcmp(method, "export_value_solver") == 0) {
+        return ia_handle_export_value_solver(id, params);
+    }
     if (strcmp(method, "query_value_range") == 0) {
         return ia_handle_query_value_range(id, params);
     }
@@ -3237,6 +3366,9 @@ void ia_rpc_init(CPUState *cpu)
 
     ia_init_primitives_once();
     symsan_reset_load_metadata();
+    if (dfsan_begin_value_solver_capture) {
+        dfsan_begin_value_solver_capture();
+    }
 
     qemu_mutex_lock(&ia_state.lock);
     if (ia_state.enabled) {
@@ -3287,8 +3419,12 @@ void ia_rpc_init(CPUState *cpu)
     ia_state.last_insn_pc = 0;
     ia_state.last_matched_pc = 0;
     ia_state.trace_seq = 0;
-    ia_state.path_constraints_head = 0;
-    ia_state.path_constraints_count = 0;
+    if (!ia_state.path_constraints) {
+        ia_state.path_constraints = g_array_new(FALSE, FALSE,
+                                                sizeof(IAPathConstraintEntry));
+    } else {
+        g_array_set_size(ia_state.path_constraints, 0);
+    }
     ia_state.exec_state = IA_EXEC_PAUSED;
     ia_state.enabled = true;
     ia_state.shutting_down = false;
@@ -3326,6 +3462,10 @@ void ia_rpc_shutdown(void)
     }
     ia_trace_close_locked();
     g_clear_pointer(&ia_state.trace_path, g_free);
+    if (ia_state.path_constraints) {
+        g_array_free(ia_state.path_constraints, TRUE);
+        ia_state.path_constraints = NULL;
+    }
     qemu_mutex_unlock(&ia_state.lock);
 }
 
@@ -3549,10 +3689,9 @@ bool ia_rpc_check_write_watchpoint(CPUState *cpu, uint64_t address,
 
 void symsan_record_path_constraint(uint64_t pc, dfsan_label label, bool taken)
 {
-    size_t idx;
     size_t max_label;
     uint8_t solver_taken = 0;
-    bool exportable;
+    IAPathConstraintEntry entry;
 
     if (label == 0 || !ia_state.enabled) {
         return;
@@ -3567,20 +3706,19 @@ void symsan_record_path_constraint(uint64_t pc, dfsan_label label, bool taken)
         return;
     }
 
-    exportable = dfsan_get_branch_direction != NULL &&
-                 dfsan_get_branch_direction(label, &solver_taken) &&
-                 solver_taken == (taken ? 1 : 0);
+    entry.pc = pc;
+    entry.label = label;
+    entry.taken = taken;
+    entry.exportable = dfsan_get_branch_direction != NULL &&
+                       dfsan_get_branch_direction(label, &solver_taken) &&
+                       solver_taken == (taken ? 1 : 0);
 
     qemu_mutex_lock(&ia_state.lock);
-    idx = ia_state.path_constraints_head;
-    ia_state.path_constraints[idx].pc = pc;
-    ia_state.path_constraints[idx].label = label;
-    ia_state.path_constraints[idx].taken = taken;
-    ia_state.path_constraints[idx].exportable = exportable;
-    ia_state.path_constraints_head = (idx + 1) % G_N_ELEMENTS(ia_state.path_constraints);
-    if (ia_state.path_constraints_count < G_N_ELEMENTS(ia_state.path_constraints)) {
-        ia_state.path_constraints_count++;
+    if (!ia_state.path_constraints) {
+        ia_state.path_constraints = g_array_new(FALSE, FALSE,
+                                                sizeof(IAPathConstraintEntry));
     }
+    g_array_append_val(ia_state.path_constraints, entry);
     qemu_mutex_unlock(&ia_state.lock);
 
     if (ia_debug_path_constraints_enabled()) {

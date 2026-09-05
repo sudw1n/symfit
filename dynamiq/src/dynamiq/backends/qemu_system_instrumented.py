@@ -619,6 +619,16 @@ class QemuSystemInstrumentedBackend:
             "negate": negate,
         }))
 
+    def begin_value_solver_capture(self) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("begin_value_solver_capture"))
+
+    def export_value_solver(self, label: str) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("export_value_solver", {
+            "label": label,
+        }))
+
     def disassemble(self, address: str, count: int) -> dict[str, Any]:
         self._require_started()
         if not self._capabilities.disassemble:

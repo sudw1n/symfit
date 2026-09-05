@@ -906,6 +906,18 @@ class AnalysisSession:
             raise UnsupportedOperationError("backend does not support evaluated path-constraint export")
         return self._forward("get_path_constraint_evaluated", backend_method(label=label, negate=negate))
 
+    def begin_value_solver_capture(self) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "begin_value_solver_capture", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support native value-solver capture")
+        return self._forward("begin_value_solver_capture", backend_method())
+
+    def export_value_solver(self, label: str) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "export_value_solver", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support native value-solver export")
+        return self._forward("export_value_solver", backend_method(label=label))
+
     def disassemble(self, address: str, count: int = 16) -> dict[str, Any]:
         if count > self.config.max_disassembly_instructions:
             raise InvalidStateError(

@@ -679,6 +679,14 @@ class ScriptSession:
         """
         return self._session.get_path_constraint_evaluated(label=label, negate=negate)
 
+    def begin_value_solver_capture(self) -> dict[str, Any]:
+        """Start a scoped native value-solver capture."""
+        return self._session.begin_value_solver_capture()
+
+    def export_value_solver(self, label: str) -> dict[str, Any]:
+        """Export a value label with native Symsan/Z3 target and path SMT2."""
+        return self._session.export_value_solver(label=label)
+
     # I/O Operations (4 methods)
     # ==========================
 
