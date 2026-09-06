@@ -1226,6 +1226,7 @@ dfsan_begin_value_solver_capture(void) {
   __branches.clear();
   deps_cache.clear();
   expr_cache.clear();
+  input_seed.clear();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
@@ -1614,6 +1615,22 @@ dfsan_export_value_solver(dfsan_label label, char *json_out,
     std::vector<size_t> selected =
         select_relevant_branch_events(label, relevant_inputs, branch_inputs);
 
+    std::unordered_map<dfsan_label, recorded_branch_t> selected_directions;
+    for (auto idx : selected) {
+      const auto &event = __recorded_branches[idx];
+      auto inserted = selected_directions.emplace(event.label, event);
+      if (!inserted.second && inserted.first->second.taken != event.taken) {
+        take_solve_assumptions();
+        std::ostringstream message;
+        message << "conflicting recorded directions for label "
+                << hex_u64(event.label) << " at " << hex_u64(event.pc)
+                << " (seq " << inserted.first->second.seq << " and "
+                << event.seq << ')';
+        copy_solve_error(message.str().c_str(), error, error_capacity);
+        return -1;
+      }
+    }
+
     expr_set_t added;
     for (auto &expr : target_load_deps) {
       if (added.insert(expr).second) {
@@ -1640,6 +1657,43 @@ dfsan_export_value_solver(dfsan_label label, char *json_out,
         __z3_context.constant(__z3_context.str_symbol("symfit_target"),
                               target.get_sort());
     __z3_solver.add(target_sym == target);
+
+    z3::check_result raw_result = __z3_solver.check();
+    if (raw_result != z3::sat) {
+      take_solve_assumptions();
+      std::string message =
+          raw_result == z3::unsat ? "value-solver path is unsat"
+                                  : "value-solver path is unknown";
+      copy_solve_error(message.c_str(), error, error_capacity);
+      return -1;
+    }
+
+    __z3_solver.push();
+    for (auto offset : relevant_inputs) {
+      auto seed = input_seed.find(offset);
+      if (seed == input_seed.end()) {
+        __z3_solver.pop();
+        take_solve_assumptions();
+        std::string message =
+            "missing concrete seed for input offset " + std::to_string(offset);
+        copy_solve_error(message.c_str(), error, error_capacity);
+        return -1;
+      }
+      std::string name = "symfit_input_" + std::to_string(offset);
+      z3::expr input = __z3_context.constant(
+          __z3_context.str_symbol(name.c_str()), __z3_context.bv_sort(8));
+      __z3_solver.add(input == __z3_context.bv_val(seed->second, 8));
+    }
+    z3::check_result seed_result = __z3_solver.check();
+    __z3_solver.pop();
+    if (seed_result != z3::sat) {
+      take_solve_assumptions();
+      std::string message =
+          seed_result == z3::unsat ? "value-solver seed is unsat"
+                                   : "value-solver seed is unknown";
+      copy_solve_error(message.c_str(), error, error_capacity);
+      return -1;
+    }
 
     std::vector<dfsan_solve_assumption> assumptions =
         take_solve_assumptions();
