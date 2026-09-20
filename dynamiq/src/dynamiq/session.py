@@ -809,6 +809,16 @@ class AnalysisSession:
             return self._forward("read_memory", self.backend.read_memory(address, size))
         return self._forward("read_memory", self.backend.read_memory(address, size, address_space=address_space))
 
+    def read_symbolic_memory(self, address: str, size: int) -> dict[str, Any]:
+        if size > self.config.max_memory_read:
+            raise InvalidStateError(f"symbolic memory read exceeds max of {self.config.max_memory_read} bytes")
+        backend_method = getattr(self.backend, "read_symbolic_memory", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support symbolic memory reads")
+        return self._forward(
+            "read_symbolic_memory", backend_method(address=address, size=size)
+        )
+
     def mem_search(
         self,
         pattern: bytes | str,
@@ -911,6 +921,35 @@ class AnalysisSession:
         if not callable(backend_method):
             raise UnsupportedOperationError("backend does not support native value-solver capture")
         return self._forward("begin_value_solver_capture", backend_method())
+
+    def begin_value_query_capture(self) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "begin_value_query_capture", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support value-query capture")
+        return self._forward("begin_value_query_capture", backend_method())
+
+    def query_value_range(
+        self, label: str, lo: int | str = 0, hi: int | str = 0,
+        base: int | str = 0, relaxation: str = "auto",
+    ) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "query_value_range", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support value-range queries")
+        return self._forward(
+            "query_value_range",
+            backend_method(label=label, lo=lo, hi=hi, base=base, relaxation=relaxation),
+        )
+
+    def query_value_eq(
+        self, label: str, target: int | str, relaxation: str = "auto",
+    ) -> dict[str, Any]:
+        backend_method = getattr(self.backend, "query_value_eq", None)
+        if not callable(backend_method):
+            raise UnsupportedOperationError("backend does not support value equality queries")
+        return self._forward(
+            "query_value_eq",
+            backend_method(label=label, target=target, relaxation=relaxation),
+        )
 
     def export_value_solver(self, label: str) -> dict[str, Any]:
         backend_method = getattr(self.backend, "export_value_solver", None)

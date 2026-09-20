@@ -117,7 +117,8 @@ int dfsan_solve_path_constraint(dfsan_label label, u8 desired_taken,
                                 uptr *assumption_count,
                                 char *error, uptr error_capacity);
 int dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
-                            uint64_t base, uint64_t *out_min, uint64_t *out_max,
+                            uint64_t base, uint64_t *out_seed,
+                            uint64_t *out_min, uint64_t *out_max,
                             uptr *assumption_count,
                             char *error, uptr error_capacity);
 
@@ -126,8 +127,22 @@ int dfsan_query_value_eq(dfsan_label label, uint64_t target,
                          uptr assignment_capacity, uptr *assignment_count,
                          uptr *assumption_count,
                          char *error, uptr error_capacity);
+int dfsan_query_value_candidate(dfsan_label label, u64 minimum, u64 maximum,
+                                u64 *out_value,
+                                dfsan_solve_assignment *assignments,
+                                uptr assignment_capacity,
+                                uptr *assignment_count,
+                                uptr *assumption_count,
+                                char *error, uptr error_capacity);
 
 void dfsan_begin_value_solver_capture(void);
+void dfsan_begin_value_query_capture(void);
+int dfsan_set_value_query_relaxation_profile(unsigned profile);
+int dfsan_get_value_query_seed(dfsan_label label, u64 *out_value,
+                               dfsan_solve_assignment *assignments,
+                               uptr assignment_capacity,
+                               uptr *assignment_count,
+                               char *error, uptr error_capacity);
 int dfsan_export_value_solver(dfsan_label label, char *json_out,
                               uptr json_capacity, uptr *json_len,
                               char *error, uptr error_capacity);

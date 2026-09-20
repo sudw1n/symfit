@@ -111,6 +111,7 @@ Optional (recommended):
 - `solve_path_constraint`
 - `query_value_range`
 - `query_value_eq`
+- `begin_value_query_capture`
 - `queue_stdin_chunk`
 - `start_trace`
 - `stop_trace`
@@ -385,8 +386,13 @@ Behavior:
 - `label` may be any *value* label (an out-of-bounds offset, length, or payload
   byte), not only a branch-condition label; this is the capability query that
   `solve_path_constraint` cannot express
-- computes the unsigned minimum and maximum of the value expression subject to
-  the recorded path constraints, by binary search (KOOBE-style `findMinMax`)
+- computes the unsigned minimum and maximum of the value expression and returns
+  endpoint input witnesses plus four sampled candidates
+- with `relaxation="auto"`, tries in order: full path and loads; path without
+  branch-load equalities; target plus target-load constraints; target with
+  observed loads concretized
+- records every failed profile; if none succeeds, returns a complete seed-only
+  result rather than turning solver inconsistency into an RPC failure
 - requires the `query_value_range` capability, which is unavailable when the
   active Symsan runtime does not provide value-range querying
 - a `conditional` result depends on concretized symbolic-load assumptions that
@@ -403,11 +409,17 @@ Parameters:
 - `base`: optional value (integer or hex string) subtracted from the reported
   `min`/`max`, default `0`; pass the object base to get reach directly (e.g. an
   OOB offset relative to its allocation). Must be `<=` the true minimum.
+- `relaxation`: `"auto"` (the default and active workflow policy)
 
 Returns:
 
 - `label`: normalized label hex string
-- `min`, `max`: the unsigned range endpoints (reach, if `base` was given)
+- `status`: `complete`, including seed-only completion
+- `selected_profile`: the most constrained successful profile, when any
+- `relaxation_attempts`: ordered success/failure records
+- `candidates`: observed seed, endpoint witnesses, and four samples; every
+  assignment identifies its `symfit_input_N` symbol
+- `min`, `max`: compatibility fields for the unsigned endpoints
 - `min_hex`, `max_hex`: the same endpoints as hex strings
 - `soundness`: `sound`, or `conditional` when the query relied on concretized loads
 - `assumption_count`: number of concretized symbolic-load assumptions relied on
@@ -425,22 +437,33 @@ Behavior:
 - on `sat`, the returned assignments are the input bytes producing the target;
   replay them and verify before treating the result as a reachability proof
 - a `conditional` result depends on concretized symbolic-load assumptions
+- solver failures use the same ordered automatic relaxation and are returned as
+  structured attempts; they do not fail the RPC transport
 
 Parameters:
 
 - `label`: value label encoded as a hex string
 - `target`: the concrete value to hit (integer or, for full 64-bit addresses, a
   hex string)
+- `relaxation`: `"auto"` (default)
 
 Returns:
 
 - `label`: normalized label hex string
 - `target`: normalized target hex string
-- `status`: `sat` when a satisfying input exists, otherwise `unsat`
+- `status`: `complete`; `query_status` is `sat`, `unsat`, or `seed-only`
+- `selected_profile`, `relaxation_attempts`, and `candidates` use the same
+  schema as the range query
 - `soundness`: `sound`, or `conditional` when the query relied on concretized loads
 - `assignments`: on `sat`, the input-byte assignments producing `target`, each
   with `offset`, `value`, and `value_hex`
 - `assignment_count`: number of assignments returned
+
+### `begin_value_query_capture`
+
+Clears recorded value-query path state and concrete input seeds before the
+approved seed path is executed. The backend must be paused. Solver-export
+capture remains available as a debugging interface for archived workflows.
 
 ### `get_recent_path_constraints`
 
@@ -541,6 +564,7 @@ Current v1 capability flags:
 - `solve_path_constraints`
 - `query_value_range`
 - `query_value_eq`
+- `begin_value_query_capture`
 - `queue_stdin_chunk`
 - `symbolize_memory`
 - `symbolize_register`

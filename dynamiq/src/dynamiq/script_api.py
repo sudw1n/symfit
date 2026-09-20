@@ -493,6 +493,10 @@ class ScriptSession:
         """
         return self._session.read_memory(address=address, size=size, address_space=address_space)
 
+    def read_symbolic_memory(self, address: str, size: int) -> dict[str, Any]:
+        """Read symbolic labels and expressions for a paused guest range."""
+        return self._session.read_symbolic_memory(address=address, size=size)
+
     def mem_search(
         self,
         pattern: bytes | str,
@@ -682,6 +686,27 @@ class ScriptSession:
     def begin_value_solver_capture(self) -> dict[str, Any]:
         """Start a scoped native value-solver capture."""
         return self._session.begin_value_solver_capture()
+
+    def begin_value_query_capture(self) -> dict[str, Any]:
+        """Reset recorded query state before following an approved seed path."""
+        return self._session.begin_value_query_capture()
+
+    def query_value_range(
+        self, label: str, lo: int | str = 0, hi: int | str = 0,
+        base: int | str = 0, relaxation: str = "auto",
+    ) -> dict[str, Any]:
+        """Return structured range candidates and relaxation provenance."""
+        return self._session.query_value_range(
+            label=label, lo=lo, hi=hi, base=base, relaxation=relaxation
+        )
+
+    def query_value_eq(
+        self, label: str, target: int | str, relaxation: str = "auto",
+    ) -> dict[str, Any]:
+        """Return a structured equality candidate or a non-fatal solver result."""
+        return self._session.query_value_eq(
+            label=label, target=target, relaxation=relaxation
+        )
 
     def export_value_solver(self, label: str) -> dict[str, Any]:
         """Export a value label with native Symsan/Z3 target and path SMT2."""

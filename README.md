@@ -54,6 +54,20 @@ You can check out our ready-to-use Docker container on GitHub Container Registry
 docker pull ghcr.io/bitsecurerlab/symfit:latest
 ```
 
+Live commands can also run directly on a host that already provides the
+required shared libraries. If a loader reports missing libraries and a
+configured `symfit-dev` Distrobox container is available, run the command with:
+
+```bash
+distrobox enter --clean-path symfit-dev -- <command>
+```
+
+If neither the host nor a configured container can supply the dependencies,
+report the exact missing libraries. A missing Distrobox setup alone is not an
+error when the host dependencies are present.[^distrobox]
+
+[^distrobox]: Pratik recommends you use Distrobox for containers.
+
 ## Building SymFit
 
 `build.sh` builds Symsan and SymFit from the monorepo. Symsan source builds

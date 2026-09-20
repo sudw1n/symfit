@@ -188,6 +188,10 @@ class MockBackend(BackendAdapter):
         self.call_history.append(f"symbolize_memory:{address}:{size}:{name}")
         return {"ok": True, "state": {}, "result": {"address": address, "size": size, "name": name}}
 
+    def read_symbolic_memory(self, address, size):
+        self.call_history.append(f"read_symbolic_memory:{address}:{size}")
+        return {"ok": True, "state": {}, "result": {"address": address, "size": size, "bytes": []}}
+
     def symbolize_register(self, register, name=None):
         self.call_history.append(f"symbolize_register:{register}:{name}")
         return {"ok": True, "state": {}, "result": {"register": register, "name": name}}
@@ -232,6 +236,26 @@ class MockBackend(BackendAdapter):
                 "evaluated": "true",
             },
         }
+
+    def begin_value_query_capture(self):
+        self.call_history.append("begin_value_query_capture")
+        return {"ok": True, "state": {}, "result": {"status": "started"}}
+
+    def query_value_range(self, label, lo=0, hi=0, base=0, relaxation="auto"):
+        self.call_history.append(
+            f"query_value_range:{label}:{lo}:{hi}:{base}:{relaxation}"
+        )
+        return {"ok": True, "state": {}, "result": {
+            "status": "complete", "candidates": [{"name": "seed"}],
+        }}
+
+    def query_value_eq(self, label, target, relaxation="auto"):
+        self.call_history.append(
+            f"query_value_eq:{label}:{target}:{relaxation}"
+        )
+        return {"ok": True, "state": {}, "result": {
+            "status": "complete", "query_status": "sat",
+        }}
 
     def break_at_addresses(self, addresses, timeout=5.0, max_steps=10000):
         self.call_history.append(f"break_at_addresses:{addresses}")
@@ -449,6 +473,15 @@ class TestScriptSessionMethodDelegation:
         assert result["ok"] is True
         assert "symbolize_memory:0x404000:8:buf" in backend.call_history
 
+    def test_read_symbolic_memory_delegation(self):
+        backend = MockBackend()
+        session = ScriptSession(target="/bin/ls", backend=backend)
+
+        result = session.read_symbolic_memory("0x404000", 8)
+
+        assert result["ok"] is True
+        assert "read_symbolic_memory:0x404000:8" in backend.call_history
+
     def test_symbolize_register_delegation(self):
         """Test symbolize_register() delegates to backend."""
         backend = MockBackend()
@@ -513,6 +546,17 @@ class TestScriptSessionMethodDelegation:
         assert result["ok"] is True
         assert result["result"]["evaluated"] == "true"
         assert "get_path_constraint_evaluated:0x12:False" in backend.call_history
+
+    def test_value_query_api_delegation(self):
+        backend = MockBackend()
+        session = ScriptSession(target="/bin/ls", backend=backend)
+
+        assert session.begin_value_query_capture()["result"]["status"] == "started"
+        assert session.query_value_range("0x12", lo=1, hi=9)["result"]["status"] == "complete"
+        assert session.query_value_eq("0x12", 7)["result"]["query_status"] == "sat"
+        assert "begin_value_query_capture" in backend.call_history
+        assert "query_value_range:0x12:1:9:0:auto" in backend.call_history
+        assert "query_value_eq:0x12:7:auto" in backend.call_history
 
     def test_disassemble_delegation(self):
         """Test disassemble() delegates to backend."""
@@ -816,6 +860,7 @@ def test_all_expected_methods_accessible():
         "get_state",
         "get_registers",
         "read_memory",
+        "read_symbolic_memory",
         "mem_search",
         "backtrace",
         "disassemble",

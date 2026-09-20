@@ -49,6 +49,7 @@ static std::unordered_map<dfsan_label, u32> tsize_cache;
 static std::unordered_map<dfsan_label, std::unordered_set<u32> > deps_cache;
 static std::unordered_map<dfsan_label, z3::expr> expr_cache;
 static std::unordered_map<u32, u8> input_seed;
+static unsigned __value_query_relaxation_profile = 0;
 
 // dependencies
 struct expr_hash {
@@ -1229,6 +1230,97 @@ dfsan_begin_value_solver_capture(void) {
   input_seed.clear();
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+dfsan_begin_value_query_capture(void) {
+  dfsan_begin_value_solver_capture();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_set_value_query_relaxation_profile(unsigned profile) {
+  if (profile > 3) {
+    return 0;
+  }
+  __value_query_relaxation_profile = profile;
+  return 1;
+}
+
+static void copy_solve_error(const char *message, char *error,
+                             uptr error_capacity);
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_get_value_query_seed(dfsan_label label, u64 *out_value,
+                           dfsan_solve_assignment *assignments,
+                           uptr assignment_capacity, uptr *assignment_count,
+                           char *error, uptr error_capacity) {
+  std::vector<dfsan_solve_assignment> seed_assignments;
+  if (assignment_count != nullptr) {
+    *assignment_count = 0;
+  }
+  if (error != nullptr && error_capacity != 0) {
+    error[0] = '\0';
+  }
+  try {
+    __z3_solver.reset();
+    std::unordered_set<u32> inputs;
+    begin_load_expr_dep_collection();
+    z3::expr value = serialize(label, inputs, SerializeMode::Solve);
+    take_load_expr_deps();
+    if (!value.is_bv() || value.get_sort().bv_size() > 64) {
+      copy_solve_error("seed target is not a supported bit-vector", error,
+                       error_capacity);
+      return -1;
+    }
+    for (auto offset : inputs) {
+      auto found = input_seed.find(offset);
+      if (found == input_seed.end()) {
+        copy_solve_error(("missing concrete seed for input offset " +
+                          std::to_string(offset)).c_str(), error, error_capacity);
+        return -1;
+      }
+      std::string name = "symfit_input_" + std::to_string(offset);
+      z3::expr input = __z3_context.constant(
+          __z3_context.str_symbol(name.c_str()), __z3_context.bv_sort(8));
+      __z3_solver.add(input == __z3_context.bv_val(found->second, 8));
+      dfsan_solve_assignment assignment = {};
+      assignment.offset = offset;
+      assignment.value = found->second;
+      seed_assignments.push_back(assignment);
+    }
+    if (__z3_solver.check() != z3::sat) {
+      copy_solve_error("concrete seed is not satisfiable", error, error_capacity);
+      return -1;
+    }
+    z3::expr evaluated = __z3_solver.get_model().eval(value, true);
+    uint64_t raw = 0;
+    if (!Z3_get_numeral_uint64(evaluated.ctx(), evaluated, &raw)) {
+      copy_solve_error("cannot evaluate concrete seed target", error, error_capacity);
+      return -1;
+    }
+    std::sort(seed_assignments.begin(), seed_assignments.end(),
+              [](const dfsan_solve_assignment &lhs,
+                 const dfsan_solve_assignment &rhs) {
+                return lhs.offset < rhs.offset;
+              });
+    if (out_value != nullptr) {
+      *out_value = raw;
+    }
+    if (assignment_count != nullptr) {
+      *assignment_count = seed_assignments.size();
+    }
+    if (assignments != nullptr) {
+      uptr count = std::min<uptr>(assignment_capacity, seed_assignments.size());
+      for (uptr i = 0; i < count; i++) {
+        assignments[i] = seed_assignments[i];
+      }
+    }
+    return 1;
+  } catch (z3::exception const &e) {
+    take_load_expr_deps();
+    copy_solve_error(e.msg(), error, error_capacity);
+    return -1;
+  }
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
 dfsan_get_nested_constraint_count(dfsan_label label) {
   std::vector<dfsan_label> labels;
@@ -1338,10 +1430,6 @@ static void append_model_assignments(z3::model &model,
     z3::func_decl decl = model.get_const_decl(i);
     z3::symbol name = decl.name();
 
-    if (name.kind() != Z3_INT_SYMBOL) {
-      continue;
-    }
-
     z3::expr value = model.get_const_interp(decl);
     uint64_t raw = 0;
     if (!Z3_get_numeral_uint64(value.ctx(), value, &raw)) {
@@ -1349,7 +1437,23 @@ static void append_model_assignments(z3::model &model,
     }
 
     dfsan_solve_assignment assignment = {};
-    assignment.offset = static_cast<uint64_t>(name.to_int());
+    if (name.kind() == Z3_INT_SYMBOL) {
+      assignment.offset = static_cast<uint64_t>(name.to_int());
+    } else {
+      std::string text = name.str();
+      static const std::string prefix = "symfit_input_";
+      if (text.compare(0, prefix.size(), prefix) != 0 ||
+          text.size() == prefix.size()) {
+        continue;
+      }
+      char *end = nullptr;
+      unsigned long long offset =
+          std::strtoull(text.c_str() + prefix.size(), &end, 10);
+      if (end == nullptr || *end != '\0') {
+        continue;
+      }
+      assignment.offset = static_cast<uint64_t>(offset);
+    }
     assignment.value = static_cast<uint8_t>(raw & 0xff);
     out.push_back(assignment);
   }
@@ -1700,7 +1804,7 @@ dfsan_export_value_solver(dfsan_label label, char *json_out,
     std::string smt2 = __z3_solver.to_smt2();
 
     std::ostringstream json;
-    json << "{\"export_kind\":\"value_solver_export_v2\",";
+    json << "{\"export_kind\":\"value_solver_export\",";
     json << "\"complete\":true,";
     json << "\"target\":{\"label\":";
     append_json_string(json, hex_u64(label));
@@ -1938,7 +2042,8 @@ static bool __query_feasible(z3::expr &e) {
 // error.
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
 dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
-                        uint64_t base, uint64_t *out_min, uint64_t *out_max,
+                        uint64_t base, uint64_t *out_seed,
+                        uint64_t *out_min, uint64_t *out_max,
                         uptr *assumption_count, char *error,
                         uptr error_capacity) {
   if (assumption_count != nullptr) {
@@ -1979,10 +2084,15 @@ dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
     }
 
     expr_set_t added;
-    assert_recorded_path_constraints(label, added, false, false);
-    for (auto &e : load_expr_deps) {
-      if (added.insert(e).second) {
-        __z3_solver.add(e);
+    if (__value_query_relaxation_profile <= 1) {
+      assert_recorded_path_constraints(label, added, false,
+                                       __value_query_relaxation_profile == 0);
+    }
+    if (__value_query_relaxation_profile <= 2) {
+      for (auto &e : load_expr_deps) {
+        if (added.insert(e).second) {
+          __z3_solver.add(e);
+        }
       }
     }
 
@@ -2000,6 +2110,13 @@ dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
     Z3_get_numeral_uint64(cexpr.ctx(), cexpr, &concrete);
 
     uint64_t width_max = (width >= 64) ? UINT64_MAX : ((1ULL << width) - 1ULL);
+    if ((hi_bound != 0 && lo_bound > hi_bound) || concrete < lo_bound ||
+        (hi_bound != 0 && concrete > hi_bound)) {
+      take_solve_assumptions();
+      copy_solve_error("bounded query excludes the seed endpoint", error,
+                       error_capacity);
+      return -1;
+    }
 
     // 4. Binary search for min: smallest K with (value <= K) still feasible.
     uint64_t lo = lo_bound;
@@ -2030,12 +2147,23 @@ dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
     }
     uint64_t max_val = lo;
 
+    if (min_val < lo_bound || (hi_bound != 0 && max_val > hi_bound) ||
+        min_val > max_val || base > min_val) {
+      take_solve_assumptions();
+      copy_solve_error("range endpoints violate the requested bounds", error,
+                       error_capacity);
+      return -1;
+    }
+
     std::vector<dfsan_solve_assumption> assumptions = take_solve_assumptions();
     if (assumption_count != nullptr) {
       *assumption_count = assumptions.size();
     }
     if (out_min != nullptr) {
       *out_min = min_val - base;
+    }
+    if (out_seed != nullptr) {
+      *out_seed = concrete - base;
     }
     if (out_max != nullptr) {
       *out_max = max_val - base;
@@ -2056,9 +2184,9 @@ dfsan_query_value_range(dfsan_label label, uint64_t lo_bound, uint64_t hi_bound,
 // of a min/max search it asserts value == T once and returns the satisfying
 // input-byte assignments (for concrete replay / PoC synthesis). Returns 1 (sat,
 // assignments filled), 0 (unsat), negative on error.
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
-dfsan_query_value_eq(dfsan_label label, uint64_t target,
-                     dfsan_solve_assignment *assignments,
+static int
+query_value_interval(dfsan_label label, u64 minimum, u64 maximum,
+                     u64 *out_value, dfsan_solve_assignment *assignments,
                      uptr assignment_capacity, uptr *assignment_count,
                      uptr *assumption_count, char *error, uptr error_capacity) {
   std::vector<dfsan_solve_assignment> solved_assignments;
@@ -2102,16 +2230,30 @@ dfsan_query_value_eq(dfsan_label label, uint64_t target,
     }
 
     expr_set_t added;
-    assert_recorded_path_constraints(label, added, false, false);
-    for (auto &e : load_expr_deps) {
-      if (added.insert(e).second) {
-        __z3_solver.add(e);
+    if (__value_query_relaxation_profile <= 1) {
+      assert_recorded_path_constraints(label, added, false,
+                                       __value_query_relaxation_profile == 0);
+    }
+    if (__value_query_relaxation_profile <= 2) {
+      for (auto &e : load_expr_deps) {
+        if (added.insert(e).second) {
+          __z3_solver.add(e);
+        }
       }
     }
 
-    // Assert value == target and solve once.
+    if (minimum > maximum) {
+      take_solve_assumptions();
+      copy_solve_error("candidate interval has invalid bounds", error,
+                       error_capacity);
+      return -1;
+    }
+    // Constrain the value to the requested singleton or sampling interval.
     z3::expr v64 = (width < 64) ? z3::zext(val, 64 - width) : val;
-    __z3_solver.add(v64 == __z3_context.bv_val(target, 64));
+    __z3_solver.add(z3::uge(
+        v64, __z3_context.bv_val(static_cast<uint64_t>(minimum), 64)));
+    __z3_solver.add(z3::ule(
+        v64, __z3_context.bv_val(static_cast<uint64_t>(maximum), 64)));
 
     z3::check_result result = __z3_solver.check();
     std::vector<dfsan_solve_assumption> assumptions = take_solve_assumptions();
@@ -2127,6 +2269,16 @@ dfsan_query_value_eq(dfsan_label label, uint64_t target,
     }
 
     z3::model model = __z3_solver.get_model();
+    if (out_value != nullptr) {
+      z3::expr evaluated = model.eval(v64, true);
+      uint64_t raw = 0;
+      if (!Z3_get_numeral_uint64(evaluated.ctx(), evaluated, &raw)) {
+        copy_solve_error("solver model omitted candidate value", error,
+                         error_capacity);
+        return -1;
+      }
+      *out_value = raw;
+    }
     append_model_assignments(model, solved_assignments);
     if (assignment_count != nullptr) {
       *assignment_count = solved_assignments.size();
@@ -2144,6 +2296,28 @@ dfsan_query_value_eq(dfsan_label label, uint64_t target,
     copy_solve_error(e.msg(), error, error_capacity);
     return -1;
   }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_query_value_eq(dfsan_label label, uint64_t target,
+                     dfsan_solve_assignment *assignments,
+                     uptr assignment_capacity, uptr *assignment_count,
+                     uptr *assumption_count, char *error, uptr error_capacity) {
+  return query_value_interval(label, target, target, nullptr, assignments,
+                              assignment_capacity, assignment_count,
+                              assumption_count, error, error_capacity);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_query_value_candidate(dfsan_label label, u64 minimum,
+                            u64 maximum, u64 *out_value,
+                            dfsan_solve_assignment *assignments,
+                            uptr assignment_capacity, uptr *assignment_count,
+                            uptr *assumption_count, char *error,
+                            uptr error_capacity) {
+  return query_value_interval(label, minimum, maximum, out_value, assignments,
+                              assignment_capacity, assignment_count,
+                              assumption_count, error, error_capacity);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
