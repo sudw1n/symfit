@@ -2959,7 +2959,10 @@ static QDict *ia_handle_query_value_range(int64_t id, QDict *params)
     uint64_t anchor_val = 0;
     uint64_t min_val = 0;
     uint64_t max_val = 0;
+    uint64_t selected_min = 0;
+    uint64_t selected_max = 0;
     size_t assumption_count = 0;
+    size_t selected_assumption_count = 0;
     int rc;
     char error[256] = { 0 };
     Error *err = NULL;
@@ -2998,6 +3001,7 @@ static QDict *ia_handle_query_value_range(int64_t id, QDict *params)
     const char *relaxation = qdict_get_try_str(params, "relaxation");
     QList *attempts = qlist_new();
     int selected = -1;
+    int last_success = -1;
     unsigned profile;
     if (!seed_candidate) {
         return ia_make_error_response(id, "solver_error",
@@ -3023,13 +3027,34 @@ static QDict *ia_handle_query_value_range(int64_t id, QDict *params)
         }
         if (rc == 1) {
             qdict_put_str(attempt, "status", "success");
-            selected = profile;
+            qdict_put_int(attempt, "minimum", min_val);
+            qdict_put_int(attempt, "maximum", max_val);
+            qdict_put_int(attempt, "assumption_count", assumption_count);
             qlist_append(attempts, attempt);
-            break;
+            last_success = profile;
+            selected_min = min_val;
+            selected_max = max_val;
+            selected_assumption_count = assumption_count;
+            /* A path-specific singleton is useful evidence, but not a reason to
+             * hide a broader profile that may expose a replayable capability. */
+            if (min_val != max_val || profile == 3) {
+                selected = profile;
+                break;
+            }
+            continue;
         }
         qdict_put_str(attempt, "status", rc == -3 ? "unsat" : "error");
         qdict_put_str(attempt, "error", error[0] ? error : "value range query failed");
         qlist_append(attempts, attempt);
+    }
+    if (selected < 0 && last_success >= 0) {
+        selected = last_success;
+    }
+    if (selected >= 0) {
+        min_val = selected_min;
+        max_val = selected_max;
+        assumption_count = selected_assumption_count;
+        dfsan_set_value_query_relaxation_profile((unsigned)selected);
     }
 
     result = qdict_new();
@@ -3203,6 +3228,7 @@ static QDict *ia_handle_query_value_eq(int64_t id, QDict *params)
     int rc;
     size_t assignment_count = 0;
     size_t assumption_count = 0;
+    size_t selected_assumption_count = 0;
     dfsan_solve_assignment *assignments = NULL;
     char error[256] = { 0 };
     Error *err = NULL;
@@ -3214,6 +3240,7 @@ static QDict *ia_handle_query_value_eq(int64_t id, QDict *params)
     QList *attempts = NULL;
     QDict *seed_candidate = NULL;
     int selected = -1;
+    int last_unsat = -1;
     unsigned profile;
     const char *relaxation;
 
@@ -3265,13 +3292,24 @@ static QDict *ia_handle_query_value_eq(int64_t id, QDict *params)
         if (rc >= 0) {
             qdict_put_str(attempt, "status", "success");
             qdict_put_str(attempt, "query_status", rc == 1 ? "sat" : "unsat");
-            selected = profile;
+            qdict_put_int(attempt, "assumption_count", assumption_count);
             qlist_append(attempts, attempt);
-            break;
+            if (rc == 1) {
+                selected = profile;
+                break;
+            }
+            last_unsat = profile;
+            selected_assumption_count = assumption_count;
+            continue;
         }
         qdict_put_str(attempt, "status", rc == -2 ? "unknown" : "error");
         qdict_put_str(attempt, "error", error[0] ? error : "value targeting failed");
         qlist_append(attempts, attempt);
+    }
+    if (selected < 0 && last_unsat >= 0) {
+        selected = last_unsat;
+        assumption_count = selected_assumption_count;
+        dfsan_set_value_query_relaxation_profile((unsigned)selected);
     }
     if (rc == 1 && assignment_count > 0) {
         assignments = g_new0(dfsan_solve_assignment, assignment_count);

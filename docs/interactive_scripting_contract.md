@@ -391,6 +391,10 @@ Behavior:
 - with `relaxation="auto"`, tries in order: full path and loads; path without
   branch-load equalities; target plus target-load constraints; target with
   observed loads concretized
+- a successful singleton does not stop the search; its endpoints and assumption
+  count remain in `relaxation_attempts`, and the first broader successful
+  profile supplies replay candidates. If every successful profile is a
+  singleton, the last successful profile is selected
 - records every failed profile; if none succeeds, returns a complete seed-only
   result rather than turning solver inconsistency into an RPC failure
 - requires the `query_value_range` capability, which is unavailable when the
@@ -415,8 +419,10 @@ Returns:
 
 - `label`: normalized label hex string
 - `status`: `complete`, including seed-only completion
-- `selected_profile`: the most constrained successful profile, when any
-- `relaxation_attempts`: ordered success/failure records
+- `selected_profile`: the first successful non-singleton profile, or the last
+  successful singleton profile when no broader range is found
+- `relaxation_attempts`: ordered success/failure records; successful attempts
+  include `minimum`, `maximum`, and `assumption_count`
 - `candidates`: observed seed, endpoint witnesses, and four samples; every
   assignment identifies its `symfit_input_N` symbol
 - `min`, `max`: compatibility fields for the unsigned endpoints
@@ -436,6 +442,9 @@ Behavior:
 - requires the `query_value_eq` capability
 - on `sat`, the returned assignments are the input bytes producing the target;
   replay them and verify before treating the result as a reachability proof
+- an `unsat` constrained profile does not stop automatic relaxation; the first
+  `sat` profile is selected, or the last completed `unsat` profile if none is
+  satisfiable
 - a `conditional` result depends on concretized symbolic-load assumptions
 - solver failures use the same ordered automatic relaxation and are returned as
   structured attempts; they do not fail the RPC transport
