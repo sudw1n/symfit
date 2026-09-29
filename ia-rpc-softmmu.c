@@ -2241,6 +2241,25 @@ static QDict *ia_handle_symbolize_register(int64_t id, QDict *params)
         return ia_make_error_response(id, "internal_error",
                                       "failed to create symbolic register label");
     }
+    /* The shadow slot represents the full target_ulong register. When a narrower
+     * sub-register is symbolized (e.g. 32-bit "edx" of the 64-bit rdx slot), the
+     * architectural write zero-extends the register, so the stored label must be
+     * zero-extended to the full register width. Otherwise a later full-width
+     * store of the register (e.g. an interrupt-entry spill) would ask the
+     * store-time byte split (__taint_union_store) to extract bytes beyond the
+     * label's expression width and the value-solver export would reject the
+     * out-of-range Extract. */
+    if (width_bits < TARGET_LONG_BITS) {
+        dfsan_label widened_label = dfsan_union(reg_label, 0, ZExt,
+                                                TARGET_LONG_BITS, value,
+                                                TARGET_LONG_BITS, get_pc(env));
+        if (widened_label == 0) {
+            qobject_unref(result);
+            return ia_make_error_response(id, "internal_error",
+                                          "failed to widen symbolic register label");
+        }
+        reg_label = widened_label;
+    }
     *shadow = reg_label;
     ia_ensure_symbolic_mode_active();
     value_hex = g_strdup_printf("0x%" PRIx64, value);

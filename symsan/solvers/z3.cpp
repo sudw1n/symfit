@@ -17,6 +17,9 @@
 
 using namespace __dfsan;
 
+// Forward declaration; defined later in this file.
+static std::string hex_u64(u64 value);
+
 extern "C" bool symsan_find_load_metadata_for_label(
     dfsan_label load_label, dfsan_label *addr_label, uint64_t *concrete_addr,
     uint64_t *concrete_value, uint64_t *pc) __attribute__((weak));
@@ -874,9 +877,15 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
     return cache_expr(label, base.extract(info->size - 1, 0), deps, mode);
   } else if (info->op == Extract) {
     z3::expr base = serialize(info->l1, deps, mode);
+    unsigned base_width = base.is_bv() ? base.get_sort().bv_size() : 0;
     if (!base.is_bv() || info->size == 0 ||
-        info->op2.i + info->size > base.get_sort().bv_size()) {
-      throw z3::exception("invalid extract width or offset");
+        info->op2.i + info->size > base_width) {
+      std::ostringstream message;
+      message << "invalid extract width or offset: label " << hex_u64(label)
+              << " parent " << hex_u64(info->l1) << " offset " << info->op2.i
+              << " width " << info->size << " base_width " << base_width
+              << " pc " << hex_u64(info->pc);
+      throw z3::exception(message.str().c_str());
     }
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps, mode);
@@ -1698,6 +1707,22 @@ dfsan_export_value_solver(dfsan_label label, char *json_out,
     return -1;
   }
 
+  // The RPC handler exports in two passes: a sizing pass (json_out == nullptr)
+  // that learns the length, then a fill pass with an allocated buffer. Rebuilding
+  // the export twice is not guaranteed to be byte-identical (z3::to_smt2() output
+  // can differ across two independent rebuilds of the same solver), so a large
+  // (>16MB) export could grow between passes and be truncated by copy_solve_text,
+  // producing an unterminated JSON string. Serve the fill pass from a single-entry
+  // cache populated by the sizing pass so both passes agree and the expensive
+  // solve runs only once. (RPC requests are serviced serially.)
+  static dfsan_label __value_export_cache_label = 0;
+  static std::string __value_export_cache_text;
+  if (json_out != nullptr && label == __value_export_cache_label &&
+      !__value_export_cache_text.empty()) {
+    copy_solve_text(__value_export_cache_text, json_out, json_capacity, json_len);
+    return 1;
+  }
+
   try {
     __z3_solver.reset();
     __z3_solver.set("timeout", 5000U);
@@ -1853,7 +1878,9 @@ dfsan_export_value_solver(dfsan_label label, char *json_out,
     append_json_string(json, smt2);
     json << '}';
 
-    copy_solve_text(json.str(), json_out, json_capacity, json_len);
+    __value_export_cache_text = json.str();
+    __value_export_cache_label = label;
+    copy_solve_text(__value_export_cache_text, json_out, json_capacity, json_len);
     return 1;
   } catch (z3::exception const &e) {
     take_load_expr_deps();

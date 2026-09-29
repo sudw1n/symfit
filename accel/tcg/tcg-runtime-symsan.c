@@ -495,9 +495,9 @@ uint64_t HELPER(symsan_muluh_i64)(uint64_t arg1, uint64_t arg1_label,
 {
     BINARY_HELPER_ENSURE_EXPRESSIONS
     CPUArchState *env = current_cpu->env_ptr;
-    uint64_t arg1_new = dfsan_union(arg1_label, CONST_LABEL, ZExt, 64, arg1, 64, get_pc(env));
-    uint64_t arg2_new = dfsan_union(arg2_label, CONST_LABEL, ZExt, 64, arg2, 64, get_pc(env));
-    uint64_t res = dfsan_union(arg1_new, arg2_new, Mul, 64, arg1, arg2, get_pc(env));
+    uint64_t arg1_new = dfsan_union(arg1_label, CONST_LABEL, ZExt, 128, arg1, 64, get_pc(env));
+    uint64_t arg2_new = dfsan_union(arg2_label, CONST_LABEL, ZExt, 128, arg2, 64, get_pc(env));
+    uint64_t res = dfsan_union(arg1_new, arg2_new, Mul, 128, arg1, arg2, get_pc(env));
     return dfsan_union(res,
                        CONST_LABEL,
                        Extract,
