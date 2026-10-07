@@ -190,6 +190,7 @@ const char* get_op_name(u16 op, u64 pred) {
         case 2:     return "Neg"; // Neg
         case Extract: return "Extract";
         case Concat:  return "Concat";
+        case LoadAddr: return "LoadAddr";
         case Ite:     return "If-Then-Else";
         //case Equal:   return "Equal"; // This opcode was eliminated from this branch
         case fmemcmp: return "memcmp_func";
@@ -363,6 +364,39 @@ int dfsan_concrete_page(void *addr) {
   return 0;
 }
 
+static dfsan_pc_range __taint_filter_ranges[DFSAN_MAX_PC_FILTER_RANGES];
+static size_t __taint_filter_count = 0;
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_set_taint_pc_filter(const dfsan_pc_range *ranges, uptr count) {
+  if (count > DFSAN_MAX_PC_FILTER_RANGES) return -1;
+  internal_memcpy(__taint_filter_ranges, ranges,
+                  count * sizeof(dfsan_pc_range));
+  __taint_filter_count = count;
+  fprintf(stderr, "[TAINT-FILTER] installed %zu range(s)\n", count);
+  for (size_t i = 0; i < count; i++) {
+    fprintf(stderr, "[TAINT-FILTER]   [%zu] 0x%llx — 0x%llx\n",
+            i, (unsigned long long)ranges[i].start,
+            (unsigned long long)ranges[i].end);
+  }
+  return 0;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_is_taint_pc_filtered(u64 pc) {
+  for (size_t i = 0; i < __taint_filter_count; i++) {
+    if (pc >= __taint_filter_ranges[i].start &&
+        pc < __taint_filter_ranges[i].end)
+      return 1;
+  }
+  return 0;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+dfsan_clear_taint_pc_filter(void) {
+  __taint_filter_count = 0;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label
 __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
@@ -374,6 +408,8 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   }
   if (l1 == 0 && l2 < CONST_OFFSET && op != fsize && op != Alloca) return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel) return kInitializingLabel;
+  if (pc != 0 && __taint_filter_count > 0 && dfsan_is_taint_pc_filtered(pc))
+    return 0;
 
   // special handling for bounds
   if (get_label_info(l1)->op == Alloca || get_label_info(l2)->op == Alloca) {
@@ -383,8 +419,8 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
     if (op != Extract) return 0;
   }
 
-  // special handling for bounds, which may use all four fields
-  if (op != Alloca) {
+  // special handling for bounds and symbolic-address loads, which may use op1/op2
+  if (op != Alloca && op != LoadAddr) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
@@ -419,6 +455,11 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   const char* op_name = get_op_name(op & 0xff, (op >> 8));
   //AOUT("%u = (%u, %u, %u, %u, %llu, %llu)\n", label, l1, l2, op, size, op1, op2);
   AOUT("%u = (%u, %u, %s, %u, %llu, %llu, 0x%llx)\n", label, l1, l2, op_name, size, op1, op2, pc);
+  if (((op & 0xff) == Load && l2 == 0) || (pc == 0)) {
+    fprintf(stderr, "[DIAG-LOAD-L2-ZERO] label=%u l1=%u l2=%u size=%u op1=%llu op2=%llu pc=0x%llx caller=%p\n",
+            label, l1, l2, size, (unsigned long long)op1, (unsigned long long)op2,
+            (unsigned long long)pc, __builtin_return_address(0));
+  }
   if (telemetry_enabled) {
       char jsonbuffer[956];
       char label_summary[256];
@@ -444,7 +485,7 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
     }
     internal_snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
           "{"
-          "\"source\": \"dfsan\","
+          "\"source\": \"dfsan __taint_union\","
           "\"trigger\": \"label_creation\","
           "\"label_summary\": \"%s\","
           "\"label\": %u,"
@@ -605,9 +646,10 @@ dfsan_label __taint_union_load(const dfsan_label *ls, const void *addr, uptr n) 
       // Report("WARNING: taint mixed with concrete %d %p\n", i, &ls[i]);
       // symqemu: disable app_for for now.
       // char *c = (char *)app_for(&ls[i]);
+      const u8 concrete = reinterpret_cast<const u8 *>(addr)[i];
       ++i;
       // label = __taint_union(label, 0, Concat, i * 8, 0, *c);
-      label = __taint_union(label, 0, Concat, i * 8, 0, 0, __dfsan_label_info[label0].pc);
+      label = __taint_union(label, 0, Concat, i * 8, 0, concrete, __dfsan_label_info[label0].pc);
     }
   }
   AOUT("\n");
@@ -755,11 +797,17 @@ void __taint_check_bounds(dfsan_label l, uptr addr) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void dfsan_store_label(dfsan_label l, void *addr, uptr size, u64 pc) {
-  // This check is wrong. Removed.
-  // if (l == 0) return;
-  // __taint_union_store(l, shadow_for(addr), size);
   dfsan_label *ls = getOrCreateShadow(addr, l);
   if (ls == nullptr) return;
+  if (l == 0 && getPageStart((uptr)addr) == getPageStart((uptr)addr + size - 1)) {
+    switch (size) {
+      case 1: if (ls[0] == 0) return; break;
+      case 2: if ((ls[0] | ls[1]) == 0) return; break;
+      case 4: if ((ls[0] | ls[1] | ls[2] | ls[3]) == 0) return; break;
+      case 8: if ((ls[0] | ls[1] | ls[2] | ls[3] |
+                   ls[4] | ls[5] | ls[6] | ls[7]) == 0) return; break;
+    }
+  }
   AOUT("Storing label %d with address %p, size %d, pc 0x%llx\n", l, addr, size, pc);
   __taint_union_store(l, ls, addr, size, pc);
 }
@@ -816,6 +864,14 @@ dfsan_label dfsan_create_label(off_t offset) {
   return label;
 }
 
+// Convenience function
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label dfsan_create_label_with_value(off_t offset, u8 value) {
+  dfsan_label label = dfsan_create_label(offset);
+  __dfsan_label_info[label].op2.i = value;
+  return label;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc) {
   for (dfsan_label *labelp = getOrCreateShadow(addr, label); size != 0; --size, ++labelp) {
@@ -834,7 +890,7 @@ void __dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc) {
       char jsonbuffer[500];
       snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
           "{"
-          "\"source\": \"dfsan\","
+          "\"source\": \"__dfsan_set_label\","
           "\"trigger\": \"taint_introduction\","
           "\"address\": \"0x%lx\","
           "\"label\": %u,"
@@ -968,6 +1024,7 @@ __taint_debug(dfsan_label op1, dfsan_label op2, int predicate,
               u32 size, u32 target) {
   if (op1 == 0 && op2 == 0) return;
 }
+
 
 SANITIZER_INTERFACE_ATTRIBUTE void
 taint_set_file(const char *filename, int fd) {
@@ -1293,7 +1350,7 @@ extern "C" {
 // Default empty implementations (weak) for hooks
 // SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
 //                              u32, u32, u64, u64, u32) {}
-SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u32) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, u8, u64) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_indcall, dfsan_label) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_gep, dfsan_label, uint64_t,
                              dfsan_label, int64_t, uint64_t, uint64_t, int64_t) {}
@@ -1336,7 +1393,7 @@ static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   return 0;
 }
 
-static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32 cid, void *addr) {
+static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u64 cid, void *addr) {
 
   u16 flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
@@ -1348,7 +1405,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32
     .instance_id = __instance_id,
     .addr = (uptr)addr,
     .context = __taint_trace_callstack,
-    .id = cid,
+    .id = (u32)cid,
     .label = label,
     .result = result
   };
@@ -1358,7 +1415,7 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32
 
 SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_cmp, dfsan_label op1,
                              dfsan_label op2, u32 size, u32 predicate, u64 c1,
-                             u64 c2, u32 cid) {
+                             u64 c2, u64 cid) {
   if ((op1 == 0 && op2 == 0))
     return 0;
 
@@ -1385,7 +1442,7 @@ SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_cmp, dfsan_label op1,
       char jsonbuffer[1280];
       snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
           "{"
-          "\"source\": \"dfsan\","
+          "\"source\": \"dfsan SANITIZER_INTERFACE_WEAK_DEF\","
           "\"trigger\": \"branch_eval\","
           "\"summary\": \"%s\","
           "\"pc\": \"0x%llx\","

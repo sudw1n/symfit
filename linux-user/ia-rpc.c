@@ -201,15 +201,11 @@ static void ia_update_active_flag_locked(void)
                   ia_state.exec_state == IA_EXEC_RUNNING &&
                   (ia_state.stop_address_enabled ||
                    ia_state.stop_address_set_enabled ||
-                   ia_state.instruction_budget > 0);
-    // Debug print
-    /*
-    fprintf(stderr, "[ia-flag] active=%d enabled=%d exec_state=%d "
-            "stop_addr=%d stop_set=%d budget=%lu\n",
-            active, ia_state.enabled, ia_state.exec_state,
-            ia_state.stop_address_enabled, ia_state.stop_address_set_enabled,
-            ia_state.instruction_budget);
-    */
+                   ia_state.instruction_budget > 0 ||
+                   ia_state.block_budget > 0 ||
+                   ia_state.write_watchpoint_count > 0 ||
+                   ia_state.read_watchpoint_count > 0 ||
+                   ia_state.trace_file != NULL);
     atomic_set(&ia_instrumentation_active, active);
 }
 
@@ -2120,6 +2116,7 @@ static QDict *ia_handle_set_watchpoints(int64_t id, QDict *params)
     ia_clear_watchpoint_skip_locked();
     ia_clear_read_watchpoint_match_locked();
     ia_clear_read_watchpoint_skip_locked();
+    ia_update_active_flag_locked();
     qdict_put_str(result, "status", ia_status_string_locked());
     qdict_put_bool(result, "armed", (write_count > 0 || read_count > 0));
     qdict_put(result, "watchpoints", installed);
@@ -2791,8 +2788,13 @@ static QDict *ia_handle_symbolize_memory(int64_t id, QDict *params)
         return ia_make_error_response(id, "invalid_address", "guest memory symbolization failed");
     }
 
+    qemu_mutex_lock(&ia_state.lock);
+    uint64_t base_offset = ia_state.symbolic_value_next_offset;
+    ia_state.symbolic_value_next_offset += (uint64_t)size;
+    qemu_mutex_unlock(&ia_state.lock);
+
     for (i = 0; i < size; i++) {
-        dfsan_label label = dfsan_create_label((int)i);
+        dfsan_label label = dfsan_create_label((off_t)(base_offset + i));
         dfsan_store_label(label, (uint8_t *)host_ptr + i, 1, pc);
     }
     ia_ensure_symbolic_mode_active();

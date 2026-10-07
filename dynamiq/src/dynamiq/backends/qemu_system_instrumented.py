@@ -27,6 +27,14 @@ class QemuSystemInstrumentedBackend:
 
     _RPC_PROTOCOL_VERSION = 1
 
+    _RESUME_FAMILY_METHODS = frozenset({
+        "resume",
+        "resume_until_address",
+        "resume_until_any_address",
+        "resume_until_basic_block",
+        "single_step",
+    })
+
     def __init__(
         self,
         qmp_client: QmpClient | None = None,
@@ -519,6 +527,12 @@ class QemuSystemInstrumentedBackend:
         result = MemoryReadResult.from_rpc_result(self._rpc_request("read_memory", params))
         return self._response(result.to_dict())
 
+    def read_symbolic_memory(self, address: str, size: int) -> dict[str, Any]:
+        self._require_started()
+        return self._response(
+            self._rpc_request("read_symbolic_memory", {"address": address, "size": size})
+        )
+
     def symbolize_memory(self, address: str, size: int, name: str | None = None) -> dict[str, Any]:
         self._require_started()
         params: dict[str, Any] = {"address": address, "size": size}
@@ -573,7 +587,8 @@ class QemuSystemInstrumentedBackend:
         return v if isinstance(v, str) else hex(v)
 
     def query_value_range(self, label: str, lo: "int | str" = 0, hi: "int | str" = 0,
-                          base: "int | str" = 0) -> dict[str, Any]:
+                          base: "int | str" = 0,
+                          relaxation: str = "auto") -> dict[str, Any]:
         """Min/max of a *value* label (an OOB off/len/val) under the path
         constraints -- the capability reach query the branch-flipper cannot do.
         lo/hi bound the search window (hi=0 -> the value's full bit-width max);
@@ -585,9 +600,11 @@ class QemuSystemInstrumentedBackend:
             "lo": self._u64(lo),
             "hi": self._u64(hi),
             "base": self._u64(base),
+            "relaxation": relaxation,
         }))
 
-    def query_value_eq(self, label: str, target: "int | str") -> dict[str, Any]:
+    def query_value_eq(self, label: str, target: "int | str",
+                       relaxation: str = "auto") -> dict[str, Any]:
         """Targeting query: is there an input making the value label == target,
         under the path constraints? Returns {status: 'sat'|'unsat', assignments,
         soundness}; on sat the assignments are the input bytes for concrete replay."""
@@ -595,7 +612,22 @@ class QemuSystemInstrumentedBackend:
         return self._response(self._rpc_request("query_value_eq", {
             "label": label,
             "target": self._u64(target),
+            "relaxation": relaxation,
         }))
+
+    def set_constraint_pc_filter(self, ranges: list[dict[str, str]]) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("set_constraint_pc_filter", {
+            "ranges": ranges,
+        }))
+
+    def clear_constraint_pc_filter(self) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("clear_constraint_pc_filter", {}))
+
+    def get_constraint_pc_filter(self) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("get_constraint_pc_filter", {}))
 
     def get_path_constraint_smt2(self, label: str, negate: bool = True) -> dict[str, Any]:
         """Raw SMT2 text for the path constraint at `label` -- the same
@@ -622,6 +654,22 @@ class QemuSystemInstrumentedBackend:
         return self._response(self._rpc_request("get_path_constraint_evaluated", {
             "label": label,
             "negate": negate,
+        }))
+
+    def begin_value_solver_capture(self) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("begin_value_solver_capture"))
+
+
+    def begin_value_query_capture(self) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("begin_value_query_capture"))
+
+
+    def export_value_solver(self, label: str) -> dict[str, Any]:
+        self._require_started()
+        return self._response(self._rpc_request("export_value_solver", {
+            "label": label,
         }))
 
     def disassemble(self, address: str, count: int) -> dict[str, Any]:
@@ -784,17 +832,29 @@ class QemuSystemInstrumentedBackend:
         """Read physical memory (convenience wrapper for read_memory with address_space='physical')."""
         return self.read_memory(address, size, address_space="physical")
 
-    def write_physical_memory(self, address: str, data: str | bytes) -> dict[str, Any]:
-        """Write to physical memory (system-mode specific)."""
+    def write_memory(self, address: str, data: str | bytes,
+                     address_space: str = "virtual") -> dict[str, Any]:
+        """Write to guest memory (virtual or physical)."""
         self._require_started()
         if not self._capabilities.read_memory:
             raise UnsupportedOperationError("backend does not support memory operations")
         params: dict[str, Any] = {
             "address": address,
             "data": data.hex() if isinstance(data, bytes) else data,
-            "address_space": "physical",
         }
+        if address_space == "physical":
+            params["address_space"] = "physical"
         result = self._rpc_request("write_memory", params)
+        return self._response(result)
+
+    def write_physical_memory(self, address: str, data: str | bytes) -> dict[str, Any]:
+        """Write to physical memory (system-mode specific)."""
+        return self.write_memory(address, data, address_space="physical")
+
+    def set_registers(self, registers: dict[str, str]) -> dict[str, Any]:
+        """Set CPU register values. registers is {name: hex_value_string}."""
+        self._require_started()
+        result = self._rpc_request("set_registers", {"registers": registers})
         return self._response(result)
 
     def get_machine_info(self) -> dict[str, Any]:
@@ -1112,6 +1172,72 @@ class QemuSystemInstrumentedBackend:
             raise UnsupportedOperationError("backend does not have an instrumentation RPC channel configured")
         return self._instrumentation_rpc
 
+    def reconnect_instrumentation_rpc(self) -> None:
+        """Reset the instrumentation RPC channel with a fresh socket+reader.
+
+        Public peer-surface helper for both Dynamiq callers and raw IA/RPC
+        users: call it after a resume-family SessionTimeoutError (or before an
+        explicit retry) so the next request does not hit the stale local
+        reader left behind by the timed-out resume. Test doubles exposing only
+        close()/connect() are supported.
+        """
+        rpc = self._require_rpc()
+        reconnect = getattr(rpc, "reconnect", None)
+        if callable(reconnect):
+            reconnect()
+            return
+        close = getattr(rpc, "close", None)
+        if callable(close):
+            close()
+        connect = getattr(rpc, "connect", None)
+        if not callable(connect):
+            raise InvalidStateError("instrumentation RPC client cannot be reset: no reconnect or connect method")
+        connect()
+
+    def _resync_rpc_after_resume_timeout(self, rpc: InstrumentationRpcClient) -> None:
+        """Best-effort channel reset + query_status after a resume-family timeout.
+
+        Never raises and never masks the original timeout: on resync failure the
+        running/timeout state is kept, but a successful reconnect still leaves the
+        next explicit caller retry with a fresh channel instead of a stale reader.
+        On a successful resync, session_status/pc follow the live guest.
+        """
+        try:
+            self.reconnect_instrumentation_rpc()
+        except Exception:
+            return
+        try:
+            status = rpc.request("query_status")
+        except Exception:
+            try:
+                self.reconnect_instrumentation_rpc()
+            except Exception:
+                pass
+            return
+        if not isinstance(status, dict) or "status" not in status:
+            return
+        live_status = status.get("status")
+        if isinstance(live_status, str):
+            self._state["session_status"] = live_status
+            self._state["last_rpc_status"] = live_status
+        pc = status.get("pc")
+        if isinstance(pc, str):
+            self._state["pc"] = pc
+        self._apply_runtime_status(status)
+        self._apply_trace_status(status)
+        resync_entry: dict[str, Any] = {
+            "ts": time.time(),
+            "method": "query_status",
+            "params": {"resync_after_timeout": True},
+            "timeout": None,
+            "ok": True,
+        }
+        if isinstance(live_status, str):
+            resync_entry["status"] = live_status
+        if isinstance(pc, str):
+            resync_entry["pc"] = pc
+        self._append_rpc_history(resync_entry)
+
     def _rpc_request(
         self,
         method: str,
@@ -1149,16 +1275,11 @@ class QemuSystemInstrumentedBackend:
         except SessionTimeoutError as exc:
             message = str(exc)
             self._state["last_rpc_error"] = message
-            if method in {
-                "resume",
-                "resume_until_address",
-                "resume_until_any_address",
-                "resume_until_basic_block",
-                "single_step",
-            }:
+            if method in self._RESUME_FAMILY_METHODS:
                 self._state["session_status"] = "running"
                 self._state["last_rpc_status"] = "timeout"
                 history_entry["status"] = "timeout"
+                self._resync_rpc_after_resume_timeout(rpc)
             history_entry["error"] = message
             self._append_rpc_history(history_entry)
             process_summary = None
