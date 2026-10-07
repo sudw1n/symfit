@@ -18,6 +18,9 @@
 
 using namespace __dfsan;
 
+// Forward declaration; defined later in this file.
+static std::string hex_u64(u64 value);
+
 extern "C" bool symsan_find_load_metadata_for_label(
     dfsan_label load_label, dfsan_label *addr_label, uint64_t *concrete_addr,
     uint64_t *concrete_value, uint64_t *pc) __attribute__((weak));
@@ -1018,6 +1021,16 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
     return cache_expr(label, base.extract(info->size - 1, 0), deps, mode);
   } else if (info->op == Extract) {
     z3::expr base = serialize(info->l1, deps, mode);
+    unsigned base_width = base.is_bv() ? base.get_sort().bv_size() : 0;
+    if (!base.is_bv() || info->size == 0 ||
+        info->op2.i + info->size > base_width) {
+      std::ostringstream message;
+      message << "invalid extract width or offset: label " << hex_u64(label)
+              << " parent " << hex_u64(info->l1) << " offset " << info->op2.i
+              << " width " << info->size << " base_width " << base_width
+               << " pc " << hex_u64(info->pc);
+      throw z3::exception(message.str().c_str());
+    }
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps, mode);
   } else if (info->op == Not) {
