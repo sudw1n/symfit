@@ -214,6 +214,19 @@ ifdef CONFIG_DARWIN
 	$(call quiet-command,SetFile -a C $@,"SETFILE","$(TARGET_DIR)$@")
 endif
 
+ifeq ($(TARGET_NAME):$(CONFIG_SOFTMMU):$(CONFIG_2nd_CCACHE),x86_64:y:y)
+# Use the production CPU objects and definitions; wrap only the program entry.
+lazy_flags_test.o: $(SRC_PATH)/tests/symfit/system/lazy_flags_test.c $(SRC_PATH)/target/i386/cpu.h
+	$(call quiet-command,$(CC) $(QEMU_LOCAL_INCLUDES) $(QEMU_INCLUDES) $(QEMU_CFLAGS) $(QEMU_DGFLAGS) $(CFLAGS) -c $< -o $@,"CC","$@")
+-include lazy_flags_test.d
+lazy-flags-test: LDFLAGS += -Wl,--wrap=main
+lazy-flags-test: lazy_flags_test.o $(all-obj-y) $(COMMON_LDADDS) $(CPU_LDADDS)
+	$(call LINK, $(filter-out %.mak, $^))
+.PHONY: check-lazy-flags
+check-lazy-flags: lazy-flags-test
+	./lazy-flags-test
+endif
+
 gdbstub-xml.c: $(TARGET_XML_FILES) $(SRC_PATH)/scripts/feature_to_c.sh
 	$(call quiet-command,rm -f $@ && $(SHELL) $(SRC_PATH)/scripts/feature_to_c.sh $@ $(TARGET_XML_FILES),"GEN","$(TARGET_DIR)$@")
 
