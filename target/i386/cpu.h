@@ -1397,6 +1397,14 @@ typedef struct CPUX86State {
     unsigned nr_dies;
 } CPUX86State;
 
+/* TCG maps each lazy operand's label five target words before its value. */
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_dst) -
+                  offsetof(CPUX86State, shadow_cc_dst) != 5 * sizeof(target_ulong));
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_src) -
+                  offsetof(CPUX86State, shadow_cc_src) != 5 * sizeof(target_ulong));
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_src2) -
+                  offsetof(CPUX86State, shadow_cc_src2) != 5 * sizeof(target_ulong));
+
 struct kvm_msrs;
 
 /**
@@ -1417,6 +1425,11 @@ struct X86CPU {
     CPUX86State env;
     /* space for symbolic expressions corresponding to env */
     void *env_exprs[512 + 1];   /* TCG_MAX_TEMPS + 1 (for NULL) */
+
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+    /* Host-only: never migrate a symbolic lazy tuple. */
+    bool lazy_flags_reusable;
+#endif
 
     uint32_t hyperv_spinlock_attempts;
     char *hyperv_vendor_id;
@@ -1848,6 +1861,10 @@ static inline void cpu_load_eflags(CPUX86State *env, int eflags,
 {
     CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     CC_OP = CC_OP_EFLAGS;
+    /* This C reload is an existing concretization boundary. */
+    env->shadow_cc_dst = 0;
+    env->shadow_cc_src = 0;
+    env->shadow_cc_src2 = 0;
     env->df = 1 - (2 * ((eflags >> 10) & 1));
     env->eflags = (env->eflags & ~update_mask) |
         (eflags & update_mask) | 0x2;

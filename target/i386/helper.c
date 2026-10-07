@@ -1063,9 +1063,19 @@ void x86_cpu_exec_enter(CPUState *cs)
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
 
-    CC_SRC = env->eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
-    env->df = 1 - (2 * ((env->eflags >> 10) & 1));
-    CC_OP = CC_OP_EFLAGS;
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+    if (cpu->lazy_flags_reusable) {
+        cpu->lazy_flags_reusable = false;
+    } else
+#endif
+    {
+        CC_SRC = env->eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
+        env->df = 1 - (2 * ((env->eflags >> 10) & 1));
+        CC_OP = CC_OP_EFLAGS;
+        env->shadow_cc_dst = 0;
+        env->shadow_cc_src = 0;
+        env->shadow_cc_src2 = 0;
+    }
     env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
 }
 
@@ -1075,6 +1085,9 @@ void x86_cpu_exec_exit(CPUState *cs)
     CPUX86State *env = &cpu->env;
 
     env->eflags = cpu_compute_eflags(env);
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+    cpu->lazy_flags_reusable = true;
+#endif
 }
 
 #ifndef CONFIG_USER_ONLY

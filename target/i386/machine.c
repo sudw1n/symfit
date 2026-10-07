@@ -294,6 +294,20 @@ static int cpu_pre_save(void *opaque)
     return 0;
 }
 
+static int cpu_pre_load(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+    cpu->lazy_flags_reusable = false;
+#endif
+    /* Snapshots omit symbolic state, including the lazy operand labels. */
+    cpu->env.shadow_cc_dst = 0;
+    cpu->env.shadow_cc_src = 0;
+    cpu->env.shadow_cc_src2 = 0;
+    return 0;
+}
+
 static int cpu_post_load(void *opaque, int version_id)
 {
     X86CPU *cpu = opaque;
@@ -1261,6 +1275,7 @@ VMStateDescription vmstate_x86_cpu = {
     .name = "cpu",
     .version_id = 12,
     .minimum_version_id = 11,
+    .pre_load = cpu_pre_load,
     .pre_save = cpu_pre_save,
     .post_load = cpu_post_load,
     .fields = (VMStateField[]) {

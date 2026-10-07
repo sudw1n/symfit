@@ -318,6 +318,10 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
                 return 4;
             }
         case IDX_FLAGS_REG:
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+            /* Even an identical debugger write replaces the symbolic state. */
+            cpu->lazy_flags_reusable = false;
+#endif
             env->eflags = ldl_p(mem_buf);
             return 4;
 

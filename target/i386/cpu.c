@@ -4662,6 +4662,10 @@ static void x86_cpu_reset(CPUState *s)
 
     xcc->parent_reset(s);
 
+#if defined(CONFIG_2nd_CCACHE) && !defined(CONFIG_USER_ONLY)
+    cpu->lazy_flags_reusable = false;
+#endif
+
     memset(env, 0, offsetof(CPUX86State, end_reset_fields));
 
     env->old_exception = -1;
